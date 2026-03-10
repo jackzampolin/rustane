@@ -1,5 +1,6 @@
 /target
 dev/
+viz/
 models/
 *.gguf
 .env
