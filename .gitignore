@@ -3,5 +3,10 @@ dev/
 viz/
 models/
 *.gguf
+*.metallib
+*.air
+*.profraw
+*.profdata
+*.log
 .env
 .DS_Store
