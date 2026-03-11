@@ -1,0 +1,12 @@
+# Results Index
+
+> Master log. One-line summaries pointing to detailed test logs.
+
+| Date | Phase | Test | Result | Log |
+|------|-------|------|--------|-----|
+| 2026-03-10 | 0.5.1 | GPU TFLOPS (MLX matmul) | Peak 14.74 TFLOPS fp16, 40% of Apple's claimed 36.86 | [gpu_tflops_m4max.md](gpu_tflops_m4max.md) |
+| 2026-03-10 | 0 | ANE crate source analysis | IOSurface layout matches, weight blobs work, 1 gap (write helpers) | [phase0_analysis.md](phase0_analysis.md) |
+| 2026-03-10 | 0 | Phase 0 verification (5 tests) | ALL PASS — multi-blob compile, ANE eval (1+1)*2=4.0, IOSurface roundtrip, RAII guards, interleaved layout | tests/phase0_verify.rs |
+| 2026-03-10 | 0.5.2 | ANE TFLOPS (conv1x1) | Peak 7.3 TFLOPS at 768→3072 w=512. Single kernels = 38% of Orion's 19 TFLOPS claim. | [ane_tflops_m4max.md](ane_tflops_m4max.md) |
+| 2026-03-10 | 0.5.5 | f32↔f16 conversion | half crate 3-4x faster than ane crate. 13.55 GB/s peak. <1ms for 2.4M elements. | [f16_convert_m4max.md](f16_convert_m4max.md) |
+| 2026-03-10 | 1 | DynMatmul training probe | slice+transpose+matmul COMPILES + RUNS on ANE. 1000 iters ✓. Dynamic weight update ✓. | [phase1_training_probe.md](phase1_training_probe.md) |
