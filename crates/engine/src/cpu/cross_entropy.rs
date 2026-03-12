@@ -51,6 +51,48 @@ pub fn backward(log_softmax: &[f32], target: usize, d_logits: &mut [f32]) {
     d_logits[target] -= 1.0;
 }
 
+/// Batched cross-entropy forward+backward (single alloc for all positions).
+/// `logits`: [seq * vocab] row-major, `targets`: [seq] target class indices.
+/// Writes gradients into `dlogits` [seq * vocab], scaled by `inv_seq`.
+/// Returns total loss (sum over positions, NOT averaged).
+pub fn forward_backward_batch(
+    logits: &[f32],
+    targets: &[u32],
+    vocab: usize,
+    dlogits: &mut [f32],
+    inv_seq: f32,
+) -> f32 {
+    let seq = targets.len();
+    let mut shifted = vec![0.0f32; vocab];
+    let mut exp_vals = vec![0.0f32; vocab];
+    let mut total_loss = 0.0f32;
+
+    for s in 0..seq {
+        let tok_logits = &logits[s * vocab..(s + 1) * vocab];
+        let target = targets[s] as usize;
+
+        // log-softmax: shifted = logits - max
+        let max_val = vdsp::maxv(tok_logits);
+        vdsp::vsadd(tok_logits, -max_val, &mut shifted);
+
+        // exp(shifted) for sum
+        vdsp::expf(&shifted, &mut exp_vals);
+        let log_sum_exp = vdsp::sve(&exp_vals).ln();
+
+        // loss = -(shifted[target] - log_sum_exp)
+        total_loss -= shifted[target] - log_sum_exp;
+
+        // backward: d_logits = (softmax - one_hot) / seq
+        // log_softmax = shifted - log_sum_exp → softmax = exp(log_softmax)
+        vdsp::vsadd(&shifted, -log_sum_exp, &mut exp_vals); // exp_vals = log_softmax
+        let d_tok = &mut dlogits[s * vocab..(s + 1) * vocab];
+        vdsp::expf(&exp_vals, d_tok);  // d_tok = softmax
+        d_tok[target] -= 1.0;
+        vdsp::sscal(d_tok, inv_seq);
+    }
+    total_loss
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

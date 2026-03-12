@@ -189,18 +189,11 @@ pub fn forward(
         Vec::new()
     };
 
-    // 6. Cross-entropy loss (per-token, averaged) — write directly into dlogits slice
-    let mut total_loss = 0.0f32;
+    // 6. Cross-entropy loss (batched — single alloc for all positions)
     let mut dlogits = vec![0.0f32; seq * vocab];
-    let inv_seq = 1.0 / seq as f32;
-    for s in 0..seq {
-        let tok_logits = &logits[s * vocab..(s + 1) * vocab];
-        let (loss, log_sm) = cross_entropy::forward(tok_logits, targets[s] as usize);
-        total_loss += loss;
-        let d_tok = &mut dlogits[s * vocab..(s + 1) * vocab];
-        cross_entropy::backward(&log_sm, targets[s] as usize, d_tok);
-        vdsp::sscal(d_tok, inv_seq);
-    }
+    let total_loss = cross_entropy::forward_backward_batch(
+        &logits, targets, vocab, &mut dlogits, 1.0 / seq as f32,
+    );
 
     ForwardResult {
         loss: total_loss / seq as f32,
