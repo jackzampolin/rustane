@@ -7,7 +7,7 @@ use crate::cpu::{rmsnorm, cross_entropy, embedding, vdsp};
 use crate::layer::{self, CompiledKernels, LayerWeights, LayerGrads, ForwardCache};
 use crate::model::ModelConfig;
 use crate::training::LayerOptState;
-use crate::cpu::adam::{self, AdamConfig};
+use crate::metal_adam::MetalAdam;
 
 /// Full model weights.
 pub struct ModelWeights {
@@ -321,6 +321,7 @@ pub fn backward(
 }
 
 /// Apply Adam to all model weights with split learning rates.
+/// Batches all 56 parameter updates into a single Metal GPU command buffer.
 pub fn update_weights(
     cfg: &ModelConfig,
     weights: &mut ModelWeights,
@@ -329,28 +330,19 @@ pub fn update_weights(
     t: u32,
     lr: f32,
     tc: &TrainConfig,
+    metal_adam: &MetalAdam,
 ) {
-    let matrix_cfg = AdamConfig {
-        lr: lr * tc.matrix_lr_scale,
-        beta1: tc.beta1, beta2: tc.beta2, eps: tc.eps,
-        weight_decay: tc.weight_decay,
-    };
-    let norm_cfg = AdamConfig {
-        lr,
-        beta1: tc.beta1, beta2: tc.beta2, eps: tc.eps,
-        weight_decay: 0.0, // no weight decay on norms
-    };
-    let embed_cfg = AdamConfig {
-        lr: lr * tc.embed_lr_scale,
-        beta1: tc.beta1, beta2: tc.beta2, eps: tc.eps,
-        weight_decay: 0.0, // no weight decay on embeddings
-    };
+    let (b1, b2, eps, wd) = (tc.beta1, tc.beta2, tc.eps, tc.weight_decay);
+    let matrix_lr = lr * tc.matrix_lr_scale;
+    let embed_lr = lr * tc.embed_lr_scale;
 
-    // Embedding
-    adam::step(&mut weights.embed, &grads.dembed, &mut opt.embed_m, &mut opt.embed_v, t, &embed_cfg);
+    let mut batch = metal_adam.begin_batch();
 
-    // Final RMSNorm
-    adam::step(&mut weights.gamma_final, &grads.dgamma_final, &mut opt.gamma_final_m, &mut opt.gamma_final_v, t, &norm_cfg);
+    // Embedding (no weight decay)
+    batch.add(&mut weights.embed, &grads.dembed, &mut opt.embed_m, &mut opt.embed_v, t, embed_lr, b1, b2, eps, 0.0);
+
+    // Final RMSNorm (no weight decay)
+    batch.add(&mut weights.gamma_final, &grads.dgamma_final, &mut opt.gamma_final_m, &mut opt.gamma_final_v, t, lr, b1, b2, eps, 0.0);
 
     // Per-layer
     for l in 0..cfg.nlayers {
@@ -359,18 +351,20 @@ pub fn update_weights(
         let o = &mut opt.layers[l];
 
         // Weight matrices
-        adam::step(&mut w.wq, &g.dwq, &mut o.m_wq, &mut o.v_wq, t, &matrix_cfg);
-        adam::step(&mut w.wk, &g.dwk, &mut o.m_wk, &mut o.v_wk, t, &matrix_cfg);
-        adam::step(&mut w.wv, &g.dwv, &mut o.m_wv, &mut o.v_wv, t, &matrix_cfg);
-        adam::step(&mut w.wo, &g.dwo, &mut o.m_wo, &mut o.v_wo, t, &matrix_cfg);
-        adam::step(&mut w.w1, &g.dw1, &mut o.m_w1, &mut o.v_w1, t, &matrix_cfg);
-        adam::step(&mut w.w3, &g.dw3, &mut o.m_w3, &mut o.v_w3, t, &matrix_cfg);
-        adam::step(&mut w.w2, &g.dw2, &mut o.m_w2, &mut o.v_w2, t, &matrix_cfg);
+        batch.add(&mut w.wq, &g.dwq, &mut o.m_wq, &mut o.v_wq, t, matrix_lr, b1, b2, eps, wd);
+        batch.add(&mut w.wk, &g.dwk, &mut o.m_wk, &mut o.v_wk, t, matrix_lr, b1, b2, eps, wd);
+        batch.add(&mut w.wv, &g.dwv, &mut o.m_wv, &mut o.v_wv, t, matrix_lr, b1, b2, eps, wd);
+        batch.add(&mut w.wo, &g.dwo, &mut o.m_wo, &mut o.v_wo, t, matrix_lr, b1, b2, eps, wd);
+        batch.add(&mut w.w1, &g.dw1, &mut o.m_w1, &mut o.v_w1, t, matrix_lr, b1, b2, eps, wd);
+        batch.add(&mut w.w3, &g.dw3, &mut o.m_w3, &mut o.v_w3, t, matrix_lr, b1, b2, eps, wd);
+        batch.add(&mut w.w2, &g.dw2, &mut o.m_w2, &mut o.v_w2, t, matrix_lr, b1, b2, eps, wd);
 
         // RMSNorm scales (no weight decay)
-        adam::step(&mut w.gamma1, &g.dgamma1, &mut o.m_gamma1, &mut o.v_gamma1, t, &norm_cfg);
-        adam::step(&mut w.gamma2, &g.dgamma2, &mut o.m_gamma2, &mut o.v_gamma2, t, &norm_cfg);
+        batch.add(&mut w.gamma1, &g.dgamma1, &mut o.m_gamma1, &mut o.v_gamma1, t, lr, b1, b2, eps, 0.0);
+        batch.add(&mut w.gamma2, &g.dgamma2, &mut o.m_gamma2, &mut o.v_gamma2, t, lr, b1, b2, eps, 0.0);
     }
+
+    batch.execute();
 }
 
 fn sum_sq(v: &[f32], scratch: &mut Vec<f32>) -> f32 {
@@ -446,6 +440,7 @@ pub fn train_step(
     data: &[u16],          // all training tokens
     step: u32,
     tc: &TrainConfig,
+    metal_adam: &MetalAdam,
 ) -> f32 {
     let seq = cfg.seq;
     grads.zero_out();
@@ -492,8 +487,8 @@ pub fn train_step(
     // LR schedule
     let lr = learning_rate(step, tc);
 
-    // Weight update
-    update_weights(cfg, weights, grads, opt, step + 1, lr, tc);
+    // Weight update (Metal GPU)
+    update_weights(cfg, weights, grads, opt, step + 1, lr, tc, metal_adam);
 
     total_loss / tc.accum_steps as f32
 }

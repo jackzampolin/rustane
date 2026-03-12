@@ -5,6 +5,7 @@
 
 use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, TrainConfig};
 use engine::layer::CompiledKernels;
+use engine::metal_adam::MetalAdam;
 use engine::model::ModelConfig;
 
 
@@ -79,6 +80,7 @@ fn all_weight_groups_have_nonzero_gradient() {
 fn all_weights_move_after_training() {
     let cfg = ModelConfig::gpt_karpathy();
     let kernels = CompiledKernels::compile(&cfg);
+    let metal_adam = MetalAdam::new().expect("Metal GPU required");
     let mut weights = ModelWeights::random(&cfg);
     // Copy initial weights for comparison
     let embed_init = weights.embed.clone();
@@ -108,7 +110,7 @@ fn all_weights_move_after_training() {
         let fwd = full_model::forward(&cfg, &kernels, &weights, &tokens, &targets, 0.0);
         full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, 0.0, 1.0, &mut grads);
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam);
     }
 
     // Check that weights moved
@@ -139,6 +141,7 @@ fn all_weights_move_after_training() {
 fn loss_scale_invariance() {
     let cfg = ModelConfig::gpt_karpathy();
     let kernels = CompiledKernels::compile(&cfg);
+    let metal_adam = MetalAdam::new().expect("Metal GPU required");
 
     let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
     let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
@@ -159,7 +162,7 @@ fn loss_scale_invariance() {
         losses_1.push(fwd.loss);
         full_model::backward(&cfg, &kernels, &w1, &fwd, &tokens, 0.0, 1.0, &mut g1);
         let lr = full_model::learning_rate(step, &tc1);
-        full_model::update_weights(&cfg, &mut w1, &g1, &mut o1, step + 1, lr, &tc1);
+        full_model::update_weights(&cfg, &mut w1, &g1, &mut o1, step + 1, lr, &tc1, &metal_adam);
     }
 
     // Run 3 steps with loss_scale=256.0
@@ -180,7 +183,7 @@ fn loss_scale_invariance() {
         // Scale gradients by 1/loss_scale to cancel
         scale_grads(&mut g2, 1.0 / 256.0);
         let lr = full_model::learning_rate(step, &tc2);
-        full_model::update_weights(&cfg, &mut w2, &g2, &mut o2, step + 1, lr, &tc2);
+        full_model::update_weights(&cfg, &mut w2, &g2, &mut o2, step + 1, lr, &tc2, &metal_adam);
     }
 
     // Losses at each step should be identical (same initial weights, same data)
@@ -210,6 +213,7 @@ fn loss_scale_invariance() {
 fn softcap_overfit_loss_decreases() {
     let cfg = ModelConfig::gpt_karpathy();
     let kernels = CompiledKernels::compile(&cfg);
+    let metal_adam = MetalAdam::new().expect("Metal GPU required");
     let mut weights = ModelWeights::random(&cfg);
     let mut grads = ModelGrads::zeros(&cfg);
     let mut opt = ModelOptState::zeros(&cfg);
@@ -230,7 +234,7 @@ fn softcap_overfit_loss_decreases() {
         let loss = fwd.loss;
         full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, 15.0, 1.0, &mut grads);
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam);
         losses.push(loss);
         println!("step {step}: loss = {loss:.4} (softcap=15)");
     }
@@ -247,6 +251,7 @@ fn softcap_overfit_loss_decreases() {
 fn no_nan_inf_in_training_config() {
     let cfg = ModelConfig::gpt_karpathy();
     let kernels = CompiledKernels::compile(&cfg);
+    let metal_adam = MetalAdam::new().expect("Metal GPU required");
     let mut weights = ModelWeights::random(&cfg);
     let mut grads = ModelGrads::zeros(&cfg);
     let mut opt = ModelOptState::zeros(&cfg);
@@ -288,7 +293,7 @@ fn no_nan_inf_in_training_config() {
         }
 
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam);
 
         // Check weights for NaN/Inf after update
         assert!(!has_nan_inf(&weights.embed), "embed weights NaN/Inf at step {step}");

@@ -5,6 +5,7 @@
 
 use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, TrainConfig};
 use engine::layer::CompiledKernels;
+use engine::metal_adam::MetalAdam;
 use engine::model::ModelConfig;
 use std::time::Instant;
 
@@ -33,17 +34,19 @@ fn bench_training_step() {
     let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
     let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
 
+    // Init Metal Adam optimizer
+    let metal_adam = MetalAdam::new().expect("Metal GPU required");
+
     // Warmup (1 step, not timed)
     println!("\nWarmup step...");
     {
         grads.zero_out();
         let fwd = full_model::forward(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap);
         full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, tc.softcap, tc.loss_scale, &mut grads);
-        // Scale gradients: 1 / loss_scale (single microbatch, no accumulation)
         let _gsc = 1.0 / tc.loss_scale;
         full_model::clip_grads(&mut grads, tc.grad_clip);
         let lr = full_model::learning_rate(0, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, 1, lr, &tc);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, 1, lr, &tc, &metal_adam);
     }
 
     // Benchmark (5 steps)
@@ -76,7 +79,7 @@ fn bench_training_step() {
         // Update weights (Adam)
         let t_upd_start = Instant::now();
         let lr = full_model::learning_rate(step + 2, &tc); // +2 because warmup was step 1
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 2, lr, &tc);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 2, lr, &tc, &metal_adam);
         let t_upd = t_upd_start.elapsed();
 
         let total = t0.elapsed();

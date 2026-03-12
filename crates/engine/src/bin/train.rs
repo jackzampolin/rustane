@@ -9,6 +9,7 @@
 use engine::data::{TokenData, TokenBytes, compute_bpb};
 use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, TrainConfig};
 use engine::layer::CompiledKernels;
+use engine::metal_adam::MetalAdam;
 use engine::model::ModelConfig;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -176,7 +177,8 @@ fn main() {
     let kernels = CompiledKernels::compile(&cfg);
     println!("  compiled in {:.1}s", t0.elapsed().as_secs_f32());
 
-    // Init model
+    // Init model + Metal Adam optimizer
+    let metal_adam = MetalAdam::new().expect("Metal GPU required for training");
     let mut weights = ModelWeights::random(&cfg);
     let mut grads = ModelGrads::zeros(&cfg);
     let mut opt = ModelOptState::zeros(&cfg);
@@ -235,7 +237,7 @@ fn main() {
         let gnorm = full_model::grad_norm(&grads);
         full_model::clip_grads(&mut grads, tc.grad_clip);
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam);
 
         let avg_loss = total_loss / tc.accum_steps as f32;
         let step_time = step_t0.elapsed().as_secs_f32();

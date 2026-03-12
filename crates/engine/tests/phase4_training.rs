@@ -5,6 +5,7 @@
 
 use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, TrainConfig};
 use engine::layer::CompiledKernels;
+use engine::metal_adam::MetalAdam;
 use engine::model::ModelConfig;
 use std::time::Instant;
 
@@ -41,6 +42,8 @@ fn six_layer_loss_decreases() {
     let mut data_padded = vec![0u16; 10000];
     data_padded[..data.len()].copy_from_slice(&data);
 
+    let metal_adam = MetalAdam::new().expect("Metal GPU required");
+
     let mut losses = Vec::new();
     let steps = 10;
 
@@ -61,7 +64,7 @@ fn six_layer_loss_decreases() {
         );
 
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam);
 
         let elapsed = t0.elapsed().as_secs_f32();
         losses.push(loss);

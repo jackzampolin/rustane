@@ -55,53 +55,6 @@ pub struct ForwardCache {
     pub gate: Vec<f32>,        // silu(h1) * h3 [HIDDEN * SEQ]
 }
 
-/// Pre-allocated CPU-side staging scratch buffer.
-/// A single Vec<f32> reused for every kernel call, sized to the largest
-/// staging buffer needed. Eliminates ~60 Vec allocations per training step.
-pub struct LayerScratch {
-    pub stage: Vec<f32>,
-}
-
-impl LayerScratch {
-    /// Allocate scratch buffer large enough for any kernel's staging data.
-    pub fn allocate(cfg: &ModelConfig) -> Self {
-        let dim = cfg.dim;
-        let seq = cfg.seq;
-        let q_dim = cfg.q_dim;
-        let kv_dim = cfg.kv_dim;
-        let hidden = cfg.hidden;
-
-        // Compute max staging buffer size across all 10 kernels
-        let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
-        let wo_sp = dyn_matmul::spatial_width(seq, dim);
-        let ffn_sp = ffn_fused::input_spatial_width(cfg);
-        let w2t_sp = dyn_matmul::spatial_width(seq, hidden);
-        let w13t_sp = dyn_matmul::dual_spatial_width(seq, dim);
-        let wot_sp = dyn_matmul::spatial_width(seq, q_dim);
-        let bwd1_in_ch = sdpa_bwd::bwd1_input_channels(cfg);
-        let bwd2_in_ch = sdpa_bwd::bwd2_input_channels(cfg);
-        let q_bwd_sp = dyn_matmul::spatial_width(seq, dim);
-        let kv_bwd_sp = dyn_matmul::dual_spatial_width(seq, dim);
-
-        let sizes = [
-            dim * sdpa_sp,
-            q_dim * wo_sp,
-            dim * ffn_sp,
-            dim * w2t_sp,
-            hidden * w13t_sp,
-            dim * wot_sp,
-            bwd1_in_ch * seq,
-            bwd2_in_ch * seq,
-            q_dim * q_bwd_sp,
-            kv_dim * kv_bwd_sp,
-        ];
-        let max_size = sizes.iter().copied().max().unwrap();
-
-        Self {
-            stage: vec![0.0f32; max_size],
-        }
-    }
-}
 
 /// Pre-allocated IOSurface buffers for all 10 kernels (input + output each).
 /// Eliminates ~100 IOSurface alloc/dealloc cycles per training step.
