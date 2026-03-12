@@ -25,9 +25,10 @@ kernel void adam_step(
     constant float& wd       [[buffer(8)]],
     constant float& bc1      [[buffer(9)]],
     constant float& bc2      [[buffer(10)]],
+    constant float& gscale   [[buffer(11)]],
     uint id [[thread_position_in_grid]]
 ) {
-    float g = grad[id];
+    float g = grad[id] * gscale;
     float mi = beta1 * m[id] + (1.0 - beta1) * g;
     float vi = beta2 * v[id] + (1.0 - beta2) * g * g;
     m[id] = mi;
@@ -109,7 +110,7 @@ impl MetalAdam {
         weight_decay: f32,
     ) {
         let mut batch = self.begin_batch();
-        batch.add(param, grad, m, v, t, lr, beta1, beta2, eps, weight_decay);
+        batch.add(param, grad, m, v, t, lr, beta1, beta2, eps, weight_decay, 1.0);
         batch.execute();
     }
 
@@ -161,6 +162,7 @@ impl MetalAdam {
 
 impl<'a> AdamBatch<'a> {
     /// Encode one Adam dispatch into this batch.
+    /// `grad_scale` is applied to gradients inline (fused descale+clip — avoids separate CPU pass).
     pub fn add(
         &mut self,
         param: &mut [f32],
@@ -173,6 +175,7 @@ impl<'a> AdamBatch<'a> {
         beta2: f32,
         eps: f32,
         weight_decay: f32,
+        grad_scale: f32,
     ) {
         let n = param.len();
         assert_eq!(grad.len(), n);
@@ -196,6 +199,7 @@ impl<'a> AdamBatch<'a> {
         let wd_buf = self.adam.scalar_buffer(weight_decay);
         let bc1_buf = self.adam.scalar_buffer(bc1);
         let bc2_buf = self.adam.scalar_buffer(bc2);
+        let gs_buf = self.adam.scalar_buffer(grad_scale);
 
         unsafe {
             self.enc.setComputePipelineState(&self.adam.pipeline);
@@ -210,6 +214,7 @@ impl<'a> AdamBatch<'a> {
             self.enc.setBuffer_offset_atIndex(Some(&wd_buf), 0, 8);
             self.enc.setBuffer_offset_atIndex(Some(&bc1_buf), 0, 9);
             self.enc.setBuffer_offset_atIndex(Some(&bc2_buf), 0, 10);
+            self.enc.setBuffer_offset_atIndex(Some(&gs_buf), 0, 11);
 
             let tg = self.adam.pipeline.maxTotalThreadsPerThreadgroup().min(256);
             let grid = MTLSize { width: n, height: 1, depth: 1 };

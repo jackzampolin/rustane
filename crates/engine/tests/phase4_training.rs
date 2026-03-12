@@ -3,7 +3,7 @@
 //! Uses synthetic random token data to verify the full pipeline works.
 //! Exit criterion: loss decreases over training steps.
 
-use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, TrainConfig};
+use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, ModelBackwardWorkspace, TrainConfig};
 use engine::layer::CompiledKernels;
 use engine::metal_adam::MetalAdam;
 use engine::model::ModelConfig;
@@ -43,6 +43,7 @@ fn six_layer_loss_decreases() {
     data_padded[..data.len()].copy_from_slice(&data);
 
     let metal_adam = MetalAdam::new().expect("Metal GPU required");
+    let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
 
     let mut losses = Vec::new();
     let steps = 10;
@@ -60,11 +61,11 @@ fn six_layer_loss_decreases() {
         );
         let loss = fwd.loss;
         full_model::backward(
-            &cfg, &kernels, &weights, &fwd, &input_tokens, 0.0, 1.0, &mut grads,
+            &cfg, &kernels, &weights, &fwd, &input_tokens, 0.0, 1.0, &mut grads, &mut bwd_ws,
         );
 
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, 1.0);
 
         let elapsed = t0.elapsed().as_secs_f32();
         losses.push(loss);

@@ -3,7 +3,7 @@
 //! These catch bugs BEFORE burning 88 hours on a full training run.
 //! Every test uses the actual gpt_karpathy config on ANE hardware.
 
-use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, TrainConfig};
+use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, ModelBackwardWorkspace, TrainConfig};
 use engine::layer::CompiledKernels;
 use engine::metal_adam::MetalAdam;
 use engine::model::ModelConfig;
@@ -20,7 +20,8 @@ fn forward_backward_simple(
     let targets: Vec<u32> = (1..=cfg.seq).map(|i| (i % cfg.vocab) as u32).collect();
     grads.zero_out();
     let fwd = full_model::forward(cfg, kernels, weights, &tokens, &targets, 0.0);
-    full_model::backward(cfg, kernels, weights, &fwd, &tokens, 0.0, 1.0, grads);
+    let mut bwd_ws = ModelBackwardWorkspace::new(cfg);
+    full_model::backward(cfg, kernels, weights, &fwd, &tokens, 0.0, 1.0, grads, &mut bwd_ws);
     fwd.loss
 }
 
@@ -108,9 +109,10 @@ fn all_weights_move_after_training() {
     for step in 0..5 {
         grads.zero_out();
         let fwd = full_model::forward(&cfg, &kernels, &weights, &tokens, &targets, 0.0);
-        full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, 0.0, 1.0, &mut grads);
+        let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
+        full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, 0.0, 1.0, &mut grads, &mut bwd_ws);
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, 1.0);
     }
 
     // Check that weights moved
@@ -160,9 +162,10 @@ fn loss_scale_invariance() {
         g1.zero_out();
         let fwd = full_model::forward(&cfg, &kernels, &w1, &tokens, &targets, 0.0);
         losses_1.push(fwd.loss);
-        full_model::backward(&cfg, &kernels, &w1, &fwd, &tokens, 0.0, 1.0, &mut g1);
+        let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
+        full_model::backward(&cfg, &kernels, &w1, &fwd, &tokens, 0.0, 1.0, &mut g1, &mut bwd_ws);
         let lr = full_model::learning_rate(step, &tc1);
-        full_model::update_weights(&cfg, &mut w1, &g1, &mut o1, step + 1, lr, &tc1, &metal_adam);
+        full_model::update_weights(&cfg, &mut w1, &g1, &mut o1, step + 1, lr, &tc1, &metal_adam, 1.0);
     }
 
     // Run 3 steps with loss_scale=256.0
@@ -179,11 +182,11 @@ fn loss_scale_invariance() {
         g2.zero_out();
         let fwd = full_model::forward(&cfg, &kernels, &w2, &tokens, &targets, 0.0);
         losses_2.push(fwd.loss);
-        full_model::backward(&cfg, &kernels, &w2, &fwd, &tokens, 0.0, 256.0, &mut g2);
-        // Scale gradients by 1/loss_scale to cancel
-        scale_grads(&mut g2, 1.0 / 256.0);
+        let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
+        full_model::backward(&cfg, &kernels, &w2, &fwd, &tokens, 0.0, 256.0, &mut g2, &mut bwd_ws);
+        // Scale gradients by 1/loss_scale fused into Adam GPU kernel
         let lr = full_model::learning_rate(step, &tc2);
-        full_model::update_weights(&cfg, &mut w2, &g2, &mut o2, step + 1, lr, &tc2, &metal_adam);
+        full_model::update_weights(&cfg, &mut w2, &g2, &mut o2, step + 1, lr, &tc2, &metal_adam, 1.0 / 256.0);
     }
 
     // Losses at each step should be identical (same initial weights, same data)
@@ -232,9 +235,10 @@ fn softcap_overfit_loss_decreases() {
         grads.zero_out();
         let fwd = full_model::forward(&cfg, &kernels, &weights, &tokens, &targets, 15.0);
         let loss = fwd.loss;
-        full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, 15.0, 1.0, &mut grads);
+        let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
+        full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, 15.0, 1.0, &mut grads, &mut bwd_ws);
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, 1.0);
         losses.push(loss);
         println!("step {step}: loss = {loss:.4} (softcap=15)");
     }
@@ -275,8 +279,9 @@ fn no_nan_inf_in_training_config() {
         assert!(!fwd.loss.is_nan(), "loss is NaN at step {step}");
         assert!(!fwd.loss.is_infinite(), "loss is Inf at step {step}");
 
+        let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
         full_model::backward(
-            &cfg, &kernels, &weights, &fwd, &tokens, tc.softcap, tc.loss_scale, &mut grads,
+            &cfg, &kernels, &weights, &fwd, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws,
         );
 
         // Check gradients for NaN/Inf
@@ -293,7 +298,7 @@ fn no_nan_inf_in_training_config() {
         }
 
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, 1.0);
 
         // Check weights for NaN/Inf after update
         assert!(!has_nan_inf(&weights.embed), "embed weights NaN/Inf at step {step}");
@@ -328,10 +333,11 @@ fn gradient_accumulation_matches_manual() {
 
     // Manual: two forward/backward passes, sum gradients
     let mut grads_manual = ModelGrads::zeros(&cfg);
+    let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
     let fwd_a = full_model::forward(&cfg, &kernels, &weights, &tokens_a, &targets_a, 0.0);
-    full_model::backward(&cfg, &kernels, &weights, &fwd_a, &tokens_a, 0.0, 1.0, &mut grads_manual);
+    full_model::backward(&cfg, &kernels, &weights, &fwd_a, &tokens_a, 0.0, 1.0, &mut grads_manual, &mut bwd_ws);
     let fwd_b = full_model::forward(&cfg, &kernels, &weights, &tokens_b, &targets_b, 0.0);
-    full_model::backward(&cfg, &kernels, &weights, &fwd_b, &tokens_b, 0.0, 1.0, &mut grads_manual);
+    full_model::backward(&cfg, &kernels, &weights, &fwd_b, &tokens_b, 0.0, 1.0, &mut grads_manual, &mut bwd_ws);
 
     let manual_loss = (fwd_a.loss + fwd_b.loss) / 2.0;
     let manual_embed_norm = l2_norm(&grads_manual.dembed);
@@ -345,7 +351,7 @@ fn gradient_accumulation_matches_manual() {
 
     // The key check: gradients from two passes should be ~2x single pass
     let mut grads_single = ModelGrads::zeros(&cfg);
-    full_model::backward(&cfg, &kernels, &weights, &fwd_a, &tokens_a, 0.0, 1.0, &mut grads_single);
+    full_model::backward(&cfg, &kernels, &weights, &fwd_a, &tokens_a, 0.0, 1.0, &mut grads_single, &mut bwd_ws);
     let single_embed_norm = l2_norm(&grads_single.dembed);
     let single_l0_wq_norm = l2_norm(&grads_single.layers[0].dwq);
     println!("single: dembed norm = {single_embed_norm:.6}, l0.dwq norm = {single_l0_wq_norm:.6}");
@@ -407,7 +413,8 @@ fn diagnose_ffn_backward_intermediates() {
 
     grads.zero_out();
     let fwd = full_model::forward(&cfg, &kernels, &weights, &tokens, &targets, 0.0);
-    full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, 0.0, 1.0, &mut grads);
+    let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
+    full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, 0.0, 1.0, &mut grads, &mut bwd_ws);
 
     // Print all layer 0 gradient norms (extended: dw2 and dw3 too)
     let lg = &grads.layers[0];

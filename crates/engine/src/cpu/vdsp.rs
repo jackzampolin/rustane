@@ -168,6 +168,12 @@ pub fn vsadd(a: &[f32], scalar: f32, out: &mut [f32]) {
     unsafe { vDSP_vsadd(a.as_ptr(), 1, &scalar, out.as_mut_ptr(), 1, n as Length) }
 }
 
+/// In-place scalar add: v[i] += scalar
+pub fn vsadd_inplace(v: &mut [f32], scalar: f32) {
+    let n = v.len();
+    unsafe { vDSP_vsadd(v.as_ptr(), 1, &scalar, v.as_mut_ptr(), 1, n as Length) }
+}
+
 /// Fused multiply-add: out = a * scalar + b
 pub fn vsma(a: &[f32], scalar: f32, b: &[f32], out: &mut [f32]) {
     let n = a.len().min(b.len()).min(out.len());
@@ -198,6 +204,12 @@ pub fn expf(a: &[f32], out: &mut [f32]) {
     unsafe { vvexpf(out.as_mut_ptr(), a.as_ptr(), &n) }
 }
 
+/// In-place exp: v[i] = exp(v[i])
+pub fn expf_inplace(v: &mut [f32]) {
+    let n = v.len() as c_int;
+    unsafe { vvexpf(v.as_mut_ptr(), v.as_ptr(), &n) }
+}
+
 /// Element-wise reciprocal sqrt: out[i] = 1/sqrt(a[i])
 pub fn rsqrtf(a: &[f32], out: &mut [f32]) {
     let n = a.len().min(out.len()) as c_int;
@@ -208,6 +220,12 @@ pub fn rsqrtf(a: &[f32], out: &mut [f32]) {
 pub fn tanhf(a: &[f32], out: &mut [f32]) {
     let n = a.len().min(out.len()) as c_int;
     unsafe { vvtanhf(out.as_mut_ptr(), a.as_ptr(), &n) }
+}
+
+/// In-place tanh: v[i] = tanh(v[i])
+pub fn tanhf_inplace(v: &mut [f32]) {
+    let n = v.len() as c_int;
+    unsafe { vvtanhf(v.as_mut_ptr(), v.as_ptr(), &n) }
 }
 
 /// Element-wise reciprocal: out[i] = 1/a[i]

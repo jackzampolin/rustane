@@ -19,9 +19,10 @@ fn profile_layer_ops() {
     let x: Vec<f32> = (0..dim * seq).map(|i| ((i * 17 + 3) % 1000) as f32 * 0.001 - 0.5).collect();
 
     // Warmup
+    let mut bwd_ws = layer::BackwardWorkspace::new(&cfg);
     {
         let (x_next, cache) = layer::forward(&cfg, &kernels, &weights, &x);
-        let _ = layer::backward(&cfg, &kernels, &weights, &cache, &x_next, &mut grads);
+        let _ = layer::backward(&cfg, &kernels, &weights, &cache, &x_next, &mut grads, &mut bwd_ws);
     }
 
     println!("\n=== Single Layer Op-Level Profiling (3 runs) ===");
@@ -39,7 +40,7 @@ fn profile_layer_ops() {
 
         // Backward with timing
         println!("  BACKWARD:");
-        let (_dx, bwd_t) = layer::backward_timed(&cfg, &kernels, &weights, &cache, &x_next, &mut grads);
+        let (_dx, bwd_t) = layer::backward_timed(&cfg, &kernels, &weights, &cache, &x_next, &mut grads, &mut bwd_ws);
         bwd_t.print();
 
         println!("  {:<35} {:>6.2}ms\n", "FWD+BWD TOTAL", fwd_t.total_ms + bwd_t.total_ms);
@@ -49,7 +50,7 @@ fn profile_layer_ops() {
     println!("=== Category Summary (last run averages) ===");
     let (x_next, cache, fwd_t) = layer::forward_timed(&cfg, &kernels, &weights, &x);
     grads.zero_out();
-    let (_dx, bwd_t) = layer::backward_timed(&cfg, &kernels, &weights, &cache, &x_next, &mut grads);
+    let (_dx, bwd_t) = layer::backward_timed(&cfg, &kernels, &weights, &cache, &x_next, &mut grads, &mut bwd_ws);
 
     let ane_fwd = fwd_t.ane_sdpa_ms + fwd_t.ane_wo_ms + fwd_t.ane_ffn_ms;
     let stage_fwd = fwd_t.stage_sdpa_ms + fwd_t.stage_wo_ms + fwd_t.stage_ffn_ms

@@ -75,21 +75,23 @@ pub fn forward_backward_batch(
         let max_val = vdsp::maxv(tok_logits);
         vdsp::vsadd(tok_logits, -max_val, &mut shifted);
 
-        // exp(shifted) for sum
+        // exp(shifted) → softmax numerator
         vdsp::expf(&shifted, &mut exp_vals);
-        let log_sum_exp = vdsp::sve(&exp_vals).ln();
+        let sum_exp = vdsp::sve(&exp_vals);
 
-        // loss = -(shifted[target] - log_sum_exp)
-        total_loss -= shifted[target] - log_sum_exp;
+        // loss = -(shifted[target] - log(sum_exp))
+        total_loss -= shifted[target] - sum_exp.ln();
 
-        // backward: d_logits = (softmax - one_hot) / seq
-        // log_softmax = shifted - log_sum_exp → softmax = exp(log_softmax)
-        vdsp::vsadd(&shifted, -log_sum_exp, &mut exp_vals); // exp_vals = log_softmax
+        // backward: d_tok = softmax - one_hot = exp_vals/sum_exp - one_hot
+        // Reuse exp_vals directly (avoids second expf call per position)
         let d_tok = &mut dlogits[s * vocab..(s + 1) * vocab];
-        vdsp::expf(&exp_vals, d_tok);  // d_tok = softmax
+        vdsp::vsmul(&exp_vals, 1.0 / sum_exp, d_tok);
         d_tok[target] -= 1.0;
-        vdsp::sscal(d_tok, inv_seq);
     }
+
+    // Single-pass scale over full dlogits array (1 call vs 512)
+    vdsp::sscal(dlogits, inv_seq);
+
     total_loss
 }
 

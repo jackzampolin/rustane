@@ -29,6 +29,20 @@ pub fn backward(d_out: &[f32], dim: usize, token_ids: &[u32], d_table: &mut [f32
     }
 }
 
+/// Channel-first embedding backward: scatter-add from [dim, seq] layout.
+/// `d_out`: [dim, seq] channel-first, `token_ids`: [seq], `d_table`: [vocab, dim] (accumulated).
+pub fn backward_channel_first(d_out: &[f32], dim: usize, token_ids: &[u32], d_table: &mut [f32]) {
+    let seq = token_ids.len();
+    assert_eq!(d_out.len(), dim * seq);
+
+    for (s, &tok) in token_ids.iter().enumerate() {
+        let offset = tok as usize * dim;
+        for d in 0..dim {
+            d_table[offset + d] += d_out[d * seq + s];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

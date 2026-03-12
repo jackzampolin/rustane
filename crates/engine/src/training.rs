@@ -87,7 +87,8 @@ pub fn train_step(
 
     // Backward
     grads.zero_out();
-    let _dx = layer::backward(cfg, kernels, weights, &cache, &dy, grads);
+    let mut bwd_ws = layer::BackwardWorkspace::new(cfg);
+    let _dx = layer::backward(cfg, kernels, weights, &cache, &dy, grads, &mut bwd_ws);
 
     // Update weights
     update_weights(weights, grads, opt, t, adam_cfg);

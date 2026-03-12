@@ -1,7 +1,7 @@
 //! Profile model-level forward and backward breakdown.
 //! Run: cargo test -p engine --test profile_layer_ops --release -- --ignored --nocapture
 
-use engine::full_model::{self, ModelWeights, ModelGrads, TrainConfig};
+use engine::full_model::{self, ModelWeights, ModelGrads, ModelBackwardWorkspace, TrainConfig};
 use engine::layer::CompiledKernels;
 use engine::model::ModelConfig;
 use engine::cpu::{vdsp, rmsnorm, cross_entropy, embedding};
@@ -18,11 +18,13 @@ fn profile_full_step_breakdown() {
     let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
     let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
 
+    let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
+
     // Warmup
     {
         grads.zero_out();
         let fwd = full_model::forward(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap);
-        full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, tc.softcap, tc.loss_scale, &mut grads);
+        full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
     }
 
     println!("\n=== Full Step Profiling (3 runs) ===");
@@ -37,17 +39,15 @@ fn profile_full_step_breakdown() {
         let fwd_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
         let t1 = Instant::now();
-        full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, tc.softcap, tc.loss_scale, &mut grads);
+        full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
         let bwd_ms = t1.elapsed().as_secs_f32() * 1000.0;
 
         let t2 = Instant::now();
-        // Fused scale+clip (matches train_step)
+        // Grad norm only (scale fused into Adam GPU kernel)
         let gsc = 1.0 / tc.loss_scale;
         let raw_norm = full_model::grad_norm(&grads);
-        let scaled_norm = raw_norm * gsc;
-        let combined_scale = if scaled_norm > tc.grad_clip { tc.grad_clip / raw_norm } else { gsc };
-        // Use clip_grads with large max_norm to just apply the scale
-        full_model::clip_grads(&mut grads, combined_scale);
+        let _scaled_norm = raw_norm * gsc;
+        let _combined_scale = if _scaled_norm > tc.grad_clip { tc.grad_clip / raw_norm } else { gsc };
         let clip_ms = t2.elapsed().as_secs_f32() * 1000.0;
 
         println!("  forward:     {:>7.1}ms", fwd_ms);
@@ -132,10 +132,9 @@ fn profile_full_step_breakdown() {
     let mut dl = vec![0.0f32; seq * vocab];
     vdsp::vsmul(&fwd.dlogits, tc.loss_scale, &mut dl);
     if tc.softcap > 0.0 && !fwd.logits_capped.is_empty() {
-        let inv_cap = 1.0 / tc.softcap;
         for i in 0..dl.len() {
-            let tv = fwd.logits_capped[i] * inv_cap;
-            dl[i] *= 1.0 - tv * tv;
+            let t = fwd.logits_capped[i]; // already unscaled tanh
+            dl[i] *= 1.0 - t * t;
         }
     }
     println!("  scale+softcap:    {:>6.2}ms", t.elapsed().as_secs_f32() * 1000.0);
@@ -182,8 +181,9 @@ fn profile_full_step_breakdown() {
 
     // 6 layers backward
     let t = Instant::now();
+    let mut bwd_ws = engine::layer::BackwardWorkspace::new(&cfg);
     for l in (0..cfg.nlayers).rev() {
-        dy = engine::layer::backward(&cfg, &kernels, &weights.layers[l], &fwd.caches[l], &dy, &mut grads.layers[l]);
+        dy = engine::layer::backward(&cfg, &kernels, &weights.layers[l], &fwd.caches[l], &dy, &mut grads.layers[l], &mut bwd_ws);
     }
     let layer_bwd_ms = t.elapsed().as_secs_f32() * 1000.0;
     println!("  6 layers bwd:     {:>6.2}ms ({:.2}ms/layer)", layer_bwd_ms, layer_bwd_ms / 6.0);

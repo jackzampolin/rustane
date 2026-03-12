@@ -143,6 +143,100 @@ pub fn backward_batch(
     }
 }
 
+/// Channel-first RMSNorm forward on [dim, seq] data.
+/// Operates directly on channel-first layout — no transpose needed.
+/// `x` is [dim, seq], `gamma` is [dim], writes `out` [dim, seq] and `rms_inv` [seq].
+pub fn forward_channel_first(
+    x: &[f32],
+    gamma: &[f32],
+    out: &mut [f32],
+    rms_inv: &mut [f32],
+    dim: usize,
+    seq: usize,
+) {
+    // Step 1: sum_sq[s] = sum_d x[d*seq+s]^2, accumulated into rms_inv
+    for s in 0..seq {
+        rms_inv[s] = 0.0;
+    }
+    for d in 0..dim {
+        let row = &x[d * seq..(d + 1) * seq];
+        for s in 0..seq {
+            rms_inv[s] += row[s] * row[s];
+        }
+    }
+
+    // Step 2: rms_inv[s] = 1/sqrt(sum_sq[s]/dim + eps)
+    let inv_dim = 1.0 / dim as f32;
+    for s in 0..seq {
+        rms_inv[s] = 1.0 / (rms_inv[s] * inv_dim + EPS).sqrt();
+    }
+
+    // Step 3: out[d,s] = x[d,s] * rms_inv[s] * gamma[d]
+    for d in 0..dim {
+        let x_row = &x[d * seq..(d + 1) * seq];
+        let out_row = &mut out[d * seq..(d + 1) * seq];
+        let g = gamma[d];
+        for s in 0..seq {
+            out_row[s] = x_row[s] * rms_inv[s] * g;
+        }
+    }
+}
+
+/// Channel-first RMSNorm backward on [dim, seq] data.
+/// Operates directly on channel-first layout — no transpose needed.
+/// `dy`, `x` are [dim, seq], `gamma` [dim], `rms_inv` [seq].
+/// Writes `dx` [dim, seq], accumulates into `dgamma` [dim].
+/// `dot_buf` is scratch of size [seq].
+pub fn backward_channel_first(
+    dy: &[f32],
+    x: &[f32],
+    gamma: &[f32],
+    rms_inv: &[f32],
+    dx: &mut [f32],
+    dgamma: &mut [f32],
+    dim: usize,
+    seq: usize,
+    dot_buf: &mut [f32],
+) {
+    // Pass 1: compute x_hat (stored in dx), dgamma, and dot_per_pos
+    for s in 0..seq {
+        dot_buf[s] = 0.0;
+    }
+
+    for d in 0..dim {
+        let dy_row = &dy[d * seq..(d + 1) * seq];
+        let x_row = &x[d * seq..(d + 1) * seq];
+        let dx_row = &mut dx[d * seq..(d + 1) * seq];
+        let g = gamma[d];
+
+        let mut dg_accum = 0.0f32;
+        for s in 0..seq {
+            let x_hat = x_row[s] * rms_inv[s];
+            dx_row[s] = x_hat; // store x_hat temporarily
+            dg_accum += dy_row[s] * x_hat;
+            dot_buf[s] += dy_row[s] * g * x_hat;
+        }
+        dgamma[d] += dg_accum;
+    }
+
+    // Pass 2: dx = rms_inv * (dy * gamma - x_hat * dot/dim)
+    let inv_dim = 1.0 / dim as f32;
+    for s in 0..seq {
+        dot_buf[s] *= inv_dim;
+    }
+
+    for d in 0..dim {
+        let dy_row = &dy[d * seq..(d + 1) * seq];
+        let g = gamma[d];
+        let dx_row = &mut dx[d * seq..(d + 1) * seq];
+        // dx_row currently contains x_hat from pass 1
+        for s in 0..seq {
+            let x_hat = dx_row[s];
+            dx_row[s] = rms_inv[s] * (dy_row[s] * g - x_hat * dot_buf[s]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +309,101 @@ mod tests {
                 (dx[i] - numerical).abs() < 1e-2,
                 "dx[{i}]: analytical={} vs numerical={numerical}", dx[i]
             );
+        }
+    }
+
+    #[test]
+    fn channel_first_matches_batch() {
+        // Verify channel-first forward matches the transpose+batch+transpose path
+        let dim = 4;
+        let seq = 3;
+        let gamma = [1.5, 0.5, 2.0, 0.8];
+        // Channel-first [dim, seq]: x[d*seq + s]
+        let x_cf: Vec<f32> = (0..dim * seq)
+            .map(|i| ((i * 17 + 3) % 100) as f32 * 0.01 - 0.5)
+            .collect();
+
+        // Channel-first forward
+        let mut out_cf = vec![0.0f32; dim * seq];
+        let mut rms_inv_cf = vec![0.0f32; seq];
+        forward_channel_first(&x_cf, &gamma, &mut out_cf, &mut rms_inv_cf, dim, seq);
+
+        // Transpose to [seq, dim], run batch, transpose back
+        let mut x_t = vec![0.0f32; seq * dim];
+        for d in 0..dim {
+            for s in 0..seq {
+                x_t[s * dim + d] = x_cf[d * seq + s];
+            }
+        }
+        let mut out_t = vec![0.0f32; seq * dim];
+        let mut rms_inv_batch = vec![0.0f32; seq];
+        forward_batch(&x_t, &gamma, &mut out_t, &mut rms_inv_batch, dim, seq);
+        let mut out_batch_cf = vec![0.0f32; dim * seq];
+        for d in 0..dim {
+            for s in 0..seq {
+                out_batch_cf[d * seq + s] = out_t[s * dim + d];
+            }
+        }
+
+        for s in 0..seq {
+            assert!((rms_inv_cf[s] - rms_inv_batch[s]).abs() < 1e-5,
+                "rms_inv[{s}]: cf={} vs batch={}", rms_inv_cf[s], rms_inv_batch[s]);
+        }
+        for i in 0..dim * seq {
+            assert!((out_cf[i] - out_batch_cf[i]).abs() < 1e-5,
+                "out[{i}]: cf={} vs batch={}", out_cf[i], out_batch_cf[i]);
+        }
+    }
+
+    #[test]
+    fn channel_first_backward_matches_batch() {
+        let dim = 4;
+        let seq = 3;
+        let gamma = [1.5, 0.5, 2.0, 0.8];
+        let x_cf: Vec<f32> = (0..dim * seq)
+            .map(|i| ((i * 17 + 3) % 100) as f32 * 0.01 - 0.5)
+            .collect();
+        let dy_cf: Vec<f32> = (0..dim * seq)
+            .map(|i| ((i * 13 + 7) % 100) as f32 * 0.01 - 0.5)
+            .collect();
+
+        // Forward (channel-first) to get rms_inv
+        let mut out_cf = vec![0.0f32; dim * seq];
+        let mut rms_inv = vec![0.0f32; seq];
+        forward_channel_first(&x_cf, &gamma, &mut out_cf, &mut rms_inv, dim, seq);
+
+        // Channel-first backward
+        let mut dx_cf = vec![0.0f32; dim * seq];
+        let mut dgamma_cf = vec![0.0f32; dim];
+        let mut dot_buf = vec![0.0f32; seq];
+        backward_channel_first(&dy_cf, &x_cf, &gamma, &rms_inv, &mut dx_cf, &mut dgamma_cf, dim, seq, &mut dot_buf);
+
+        // Transpose, batch backward, transpose back
+        let mut dy_t = vec![0.0f32; seq * dim];
+        let mut x_t = vec![0.0f32; seq * dim];
+        for d in 0..dim {
+            for s in 0..seq {
+                dy_t[s * dim + d] = dy_cf[d * seq + s];
+                x_t[s * dim + d] = x_cf[d * seq + s];
+            }
+        }
+        let mut dx_t = vec![0.0f32; seq * dim];
+        let mut dgamma_batch = vec![0.0f32; dim];
+        backward_batch(&dy_t, &x_t, &gamma, &rms_inv, &mut dx_t, &mut dgamma_batch, dim, seq);
+        let mut dx_batch_cf = vec![0.0f32; dim * seq];
+        for d in 0..dim {
+            for s in 0..seq {
+                dx_batch_cf[d * seq + s] = dx_t[s * dim + d];
+            }
+        }
+
+        for d in 0..dim {
+            assert!((dgamma_cf[d] - dgamma_batch[d]).abs() < 1e-4,
+                "dgamma[{d}]: cf={} vs batch={}", dgamma_cf[d], dgamma_batch[d]);
+        }
+        for i in 0..dim * seq {
+            assert!((dx_cf[i] - dx_batch_cf[i]).abs() < 1e-4,
+                "dx[{i}]: cf={} vs batch={}", dx_cf[i], dx_batch_cf[i]);
         }
     }
 }

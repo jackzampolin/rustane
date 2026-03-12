@@ -3,7 +3,7 @@
 //! Run manually:
 //!   cargo test -p engine --test bench_step_time --release -- --ignored --nocapture
 
-use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, TrainConfig};
+use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, ModelForwardWorkspace, ModelBackwardWorkspace, TrainConfig};
 use engine::layer::CompiledKernels;
 use engine::metal_adam::MetalAdam;
 use engine::model::ModelConfig;
@@ -37,21 +37,27 @@ fn bench_training_step() {
     // Init Metal Adam optimizer
     let metal_adam = MetalAdam::new().expect("Metal GPU required");
 
+    // Pre-allocated workspaces (zero allocations in steady state)
+    let mut fwd_ws = ModelForwardWorkspace::new(&cfg);
+    let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
+
     // Warmup (1 step, not timed)
     println!("\nWarmup step...");
     {
         grads.zero_out();
-        let fwd = full_model::forward(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap);
-        full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, tc.softcap, tc.loss_scale, &mut grads);
-        let _gsc = 1.0 / tc.loss_scale;
-        full_model::clip_grads(&mut grads, tc.grad_clip);
+        let _loss = full_model::forward_ws(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+        full_model::backward_ws(&cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
+        let gsc = 1.0 / tc.loss_scale;
+        let raw_norm = full_model::grad_norm(&grads);
+        let scaled_norm = raw_norm * gsc;
+        let combined_scale = if scaled_norm > tc.grad_clip { tc.grad_clip / raw_norm } else { gsc };
         let lr = full_model::learning_rate(0, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, 1, lr, &tc, &metal_adam);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, 1, lr, &tc, &metal_adam, combined_scale);
     }
 
     // Benchmark (5 steps)
-    println!("\n{:<6} {:>10} {:>10} {:>10} {:>10}   {}", "step", "total", "fwd", "bwd", "upd", "loss");
-    println!("{}", "-".repeat(70));
+    println!("\n{:<6} {:>10} {:>10} {:>10} {:>10} {:>10}   {}", "step", "total", "fwd", "bwd", "norm", "upd", "loss");
+    println!("{}", "-".repeat(80));
 
     for step in 0..5u32 {
         grads.zero_out();
@@ -60,15 +66,16 @@ fn bench_training_step() {
 
         // Forward
         let t_fwd_start = Instant::now();
-        let fwd = full_model::forward(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap);
+        let loss = full_model::forward_ws(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
         let t_fwd = t_fwd_start.elapsed();
 
         // Backward
         let t_bwd_start = Instant::now();
-        full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, tc.softcap, tc.loss_scale, &mut grads);
+        full_model::backward_ws(&cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
         let t_bwd = t_bwd_start.elapsed();
 
-        // Fused scale+clip (single pass instead of two)
+        // Grad norm only (scale fused into Adam GPU kernel)
+        let t_norm_start = Instant::now();
         let gsc = 1.0 / tc.loss_scale;
         let raw_norm = full_model::grad_norm(&grads);
         let scaled_norm = raw_norm * gsc;
@@ -77,22 +84,22 @@ fn bench_training_step() {
         } else {
             gsc
         };
-        scale_grads(&mut grads, combined_scale);
+        let t_norm = t_norm_start.elapsed();
 
-        // Update weights (Adam)
+        // Update weights (Adam with fused grad scaling)
         let t_upd_start = Instant::now();
         let lr = full_model::learning_rate(step + 2, &tc); // +2 because warmup was step 1
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 2, lr, &tc, &metal_adam);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 2, lr, &tc, &metal_adam, combined_scale);
         let t_upd = t_upd_start.elapsed();
 
         let total = t0.elapsed();
-        let loss = fwd.loss;
 
-        println!("{:<6} {:>9.1}ms {:>9.1}ms {:>9.1}ms {:>9.1}ms   {:.4}",
+        println!("{:<6} {:>9.1}ms {:>9.1}ms {:>9.1}ms {:>9.1}ms {:>9.1}ms   {:.4}",
                  step,
                  total.as_secs_f32() * 1000.0,
                  t_fwd.as_secs_f32() * 1000.0,
                  t_bwd.as_secs_f32() * 1000.0,
+                 t_norm.as_secs_f32() * 1000.0,
                  t_upd.as_secs_f32() * 1000.0,
                  loss);
     }
@@ -100,19 +107,3 @@ fn bench_training_step() {
     println!("\n=== Benchmark complete ===\n");
 }
 
-/// Scale all gradient tensors by a scalar factor (in-place cblas_sscal).
-fn scale_grads(grads: &mut ModelGrads, scale: f32) {
-    engine::cpu::vdsp::sscal(&mut grads.dembed, scale);
-    engine::cpu::vdsp::sscal(&mut grads.dgamma_final, scale);
-    for lg in &mut grads.layers {
-        engine::cpu::vdsp::sscal(&mut lg.dwq, scale);
-        engine::cpu::vdsp::sscal(&mut lg.dwk, scale);
-        engine::cpu::vdsp::sscal(&mut lg.dwv, scale);
-        engine::cpu::vdsp::sscal(&mut lg.dwo, scale);
-        engine::cpu::vdsp::sscal(&mut lg.dw1, scale);
-        engine::cpu::vdsp::sscal(&mut lg.dw3, scale);
-        engine::cpu::vdsp::sscal(&mut lg.dw2, scale);
-        engine::cpu::vdsp::sscal(&mut lg.dgamma1, scale);
-        engine::cpu::vdsp::sscal(&mut lg.dgamma2, scale);
-    }
-}

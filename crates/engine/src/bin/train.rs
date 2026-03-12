@@ -7,7 +7,7 @@
 //!   [--steps 72000] [--val-interval 500] [--val-steps 20]
 
 use engine::data::{TokenData, TokenBytes, compute_bpb};
-use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, TrainConfig};
+use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, ModelForwardWorkspace, ModelBackwardWorkspace, TrainConfig};
 use engine::layer::CompiledKernels;
 use engine::metal_adam::MetalAdam;
 use engine::model::ModelConfig;
@@ -182,6 +182,8 @@ fn main() {
     let mut weights = ModelWeights::random(&cfg);
     let mut grads = ModelGrads::zeros(&cfg);
     let mut opt = ModelOptState::zeros(&cfg);
+    let mut fwd_ws = ModelForwardWorkspace::new(&cfg);
+    let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
 
     let mut tc = TrainConfig::default();
     tc.total_steps = args.total_steps;
@@ -220,24 +222,22 @@ fn main() {
             let input_tokens = train_data.tokens(pos, seq);
             let target_tokens = train_data.tokens(pos + 1, seq);
 
-            let fwd = full_model::forward(
-                &cfg, &kernels, &weights, &input_tokens, &target_tokens, tc.softcap,
+            let loss = full_model::forward_ws(
+                &cfg, &kernels, &weights, &input_tokens, &target_tokens, tc.softcap, &mut fwd_ws,
             );
-            total_loss += fwd.loss;
-            full_model::backward(
-                &cfg, &kernels, &weights, &fwd, &input_tokens, tc.softcap, tc.loss_scale, &mut grads,
+            total_loss += loss;
+            full_model::backward_ws(
+                &cfg, &kernels, &weights, &fwd_ws, &input_tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws,
             );
         }
 
-        // Scale gradients
+        // Grad norm + clip (descaling fused into Adam GPU kernel)
         let gsc = 1.0 / (tc.accum_steps as f32 * tc.loss_scale);
-        scale_all_grads(&mut grads, gsc);
-
-        // Clip + LR + update
-        let gnorm = full_model::grad_norm(&grads);
-        full_model::clip_grads(&mut grads, tc.grad_clip);
+        let raw_norm = full_model::grad_norm(&grads);
+        let gnorm = raw_norm * gsc;
+        let combined_scale = if gnorm > tc.grad_clip { tc.grad_clip / raw_norm } else { gsc };
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, combined_scale);
 
         let avg_loss = total_loss / tc.accum_steps as f32;
         let step_time = step_t0.elapsed().as_secs_f32();
@@ -279,29 +279,4 @@ fn main() {
     }
 }
 
-fn scale_all_grads(grads: &mut ModelGrads, s: f32) {
-    let mut scratch = Vec::new();
-    scale_vec(&mut grads.dembed, s, &mut scratch);
-    scale_vec(&mut grads.dgamma_final, s, &mut scratch);
-    for lg in &mut grads.layers {
-        scale_vec(&mut lg.dwq, s, &mut scratch);
-        scale_vec(&mut lg.dwk, s, &mut scratch);
-        scale_vec(&mut lg.dwv, s, &mut scratch);
-        scale_vec(&mut lg.dwo, s, &mut scratch);
-        scale_vec(&mut lg.dw1, s, &mut scratch);
-        scale_vec(&mut lg.dw3, s, &mut scratch);
-        scale_vec(&mut lg.dw2, s, &mut scratch);
-        scale_vec(&mut lg.dgamma1, s, &mut scratch);
-        scale_vec(&mut lg.dgamma2, s, &mut scratch);
-    }
-}
-
-fn scale_vec(v: &mut [f32], s: f32, scratch: &mut Vec<f32>) {
-    use engine::cpu::vdsp;
-    if scratch.len() < v.len() {
-        scratch.resize(v.len(), 0.0);
-    }
-    vdsp::vsmul(v, s, &mut scratch[..v.len()]);
-    v.copy_from_slice(&scratch[..v.len()]);
-}
 
