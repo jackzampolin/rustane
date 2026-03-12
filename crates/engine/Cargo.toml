@@ -6,3 +6,8 @@ edition.workspace = true
 [dependencies]
 ane-bridge = { path = "../ane-bridge" }
 metal-decode = { path = "../metal-decode" }
+objc2-foundation = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+objc2-foundation = { workspace = true }

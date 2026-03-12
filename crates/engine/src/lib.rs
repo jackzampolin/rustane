@@ -4,6 +4,10 @@
 //! Metal GPU for single-token decode.
 //! CPU fallback for unsupported ops.
 
-pub fn placeholder() {
-    println!("engine: TODO");
-}
+pub mod cpu;
+pub mod model;
+pub mod kernels;
+pub mod layer;
+pub mod training;
+pub mod full_model;
+pub mod data;
