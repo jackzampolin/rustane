@@ -68,13 +68,16 @@ fn bench_training_step() {
         full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, tc.softcap, tc.loss_scale, &mut grads);
         let t_bwd = t_bwd_start.elapsed();
 
-        // Scale gradients (single microbatch)
-        // backward already multiplied by loss_scale, so divide by loss_scale to get true grads
-        // (In train_step this is 1/(accum_steps * loss_scale), here accum_steps=1)
+        // Fused scale+clip (single pass instead of two)
         let gsc = 1.0 / tc.loss_scale;
-        // Apply scale to all gradient tensors
-        scale_grads(&mut grads, gsc);
-        full_model::clip_grads(&mut grads, tc.grad_clip);
+        let raw_norm = full_model::grad_norm(&grads);
+        let scaled_norm = raw_norm * gsc;
+        let combined_scale = if scaled_norm > tc.grad_clip {
+            tc.grad_clip / raw_norm
+        } else {
+            gsc
+        };
+        scale_grads(&mut grads, combined_scale);
 
         // Update weights (Adam)
         let t_upd_start = Instant::now();
@@ -97,25 +100,19 @@ fn bench_training_step() {
     println!("\n=== Benchmark complete ===\n");
 }
 
-/// Scale all gradient tensors by a scalar factor.
+/// Scale all gradient tensors by a scalar factor (in-place cblas_sscal).
 fn scale_grads(grads: &mut ModelGrads, scale: f32) {
-    scale_vec(&mut grads.dembed, scale);
-    scale_vec(&mut grads.dgamma_final, scale);
+    engine::cpu::vdsp::sscal(&mut grads.dembed, scale);
+    engine::cpu::vdsp::sscal(&mut grads.dgamma_final, scale);
     for lg in &mut grads.layers {
-        scale_vec(&mut lg.dwq, scale);
-        scale_vec(&mut lg.dwk, scale);
-        scale_vec(&mut lg.dwv, scale);
-        scale_vec(&mut lg.dwo, scale);
-        scale_vec(&mut lg.dw1, scale);
-        scale_vec(&mut lg.dw3, scale);
-        scale_vec(&mut lg.dw2, scale);
-        scale_vec(&mut lg.dgamma1, scale);
-        scale_vec(&mut lg.dgamma2, scale);
-    }
-}
-
-fn scale_vec(v: &mut [f32], s: f32) {
-    for x in v.iter_mut() {
-        *x *= s;
+        engine::cpu::vdsp::sscal(&mut lg.dwq, scale);
+        engine::cpu::vdsp::sscal(&mut lg.dwk, scale);
+        engine::cpu::vdsp::sscal(&mut lg.dwv, scale);
+        engine::cpu::vdsp::sscal(&mut lg.dwo, scale);
+        engine::cpu::vdsp::sscal(&mut lg.dw1, scale);
+        engine::cpu::vdsp::sscal(&mut lg.dw3, scale);
+        engine::cpu::vdsp::sscal(&mut lg.dw2, scale);
+        engine::cpu::vdsp::sscal(&mut lg.dgamma1, scale);
+        engine::cpu::vdsp::sscal(&mut lg.dgamma2, scale);
     }
 }

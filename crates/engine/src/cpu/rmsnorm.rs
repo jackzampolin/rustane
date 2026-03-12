@@ -76,6 +76,73 @@ pub fn backward(
     vdsp::vsmul(&scratch, rms_inv, dx); // dx *= rms_inv
 }
 
+/// Batch RMSNorm forward on position-contiguous data.
+/// `x_t` is [seq, dim] row-major (position-contiguous), `gamma` is [dim].
+/// Writes `xnorm_t` [seq, dim] and `rms_inv` [seq].
+/// Uses a single scratch allocation for all positions.
+pub fn forward_batch(
+    x_t: &[f32],
+    gamma: &[f32],
+    xnorm_t: &mut [f32],
+    rms_inv: &mut [f32],
+    dim: usize,
+    seq: usize,
+) {
+    let mut scratch = vec![0.0f32; dim];
+    for s in 0..seq {
+        let x_pos = &x_t[s * dim..(s + 1) * dim];
+        let out = &mut xnorm_t[s * dim..(s + 1) * dim];
+
+        vdsp::vmul(x_pos, x_pos, &mut scratch);
+        let mean_sq = vdsp::sve(&scratch) / dim as f32;
+        let inv = 1.0 / (mean_sq + EPS).sqrt();
+        rms_inv[s] = inv;
+
+        vdsp::vsmul(x_pos, inv, out);
+        vdsp::vmul(out, gamma, &mut scratch);
+        out.copy_from_slice(&scratch);
+    }
+}
+
+/// Batch RMSNorm backward on position-contiguous data.
+/// All inputs/outputs are [seq, dim] row-major. Accumulates into `dgamma`.
+pub fn backward_batch(
+    dy_t: &[f32],
+    x_t: &[f32],
+    gamma: &[f32],
+    rms_inv: &[f32],
+    dx_t: &mut [f32],
+    dgamma: &mut [f32],
+    dim: usize,
+    seq: usize,
+) {
+    let mut scratch = vec![0.0f32; dim];
+    let mut tmp = vec![0.0f32; dim];
+    for s in 0..seq {
+        let dy_pos = &dy_t[s * dim..(s + 1) * dim];
+        let x_pos = &x_t[s * dim..(s + 1) * dim];
+        let dx_pos = &mut dx_t[s * dim..(s + 1) * dim];
+        let inv = rms_inv[s];
+
+        // x_hat = x * inv (stored in dx temporarily)
+        vdsp::vsmul(x_pos, inv, dx_pos);
+
+        // dgamma += dy * x_hat
+        vdsp::vmul(dy_pos, dx_pos, &mut scratch);
+        vdsp::vadd(dgamma, &scratch, &mut tmp);
+        dgamma.copy_from_slice(&tmp);
+
+        // dx = inv * (dy * gamma - x_hat * mean(dy * gamma * x_hat))
+        vdsp::vmul(dy_pos, gamma, &mut scratch);
+        vdsp::vmul(&scratch, dx_pos, &mut tmp);
+        let dot = vdsp::sve(&tmp) / dim as f32;
+        vdsp::vsmul(dx_pos, dot, &mut tmp);
+        vdsp::vsub(&tmp, &scratch, dx_pos);
+        scratch.copy_from_slice(dx_pos);
+        vdsp::vsmul(&scratch, inv, dx_pos);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

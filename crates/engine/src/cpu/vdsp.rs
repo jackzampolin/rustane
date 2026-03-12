@@ -100,6 +100,28 @@ unsafe extern "C" {
     /// y[i] = tanh(x[i]) for n elements
     pub fn vvtanhf(y: *mut f32, x: *const f32, n: *const c_int);
 
+    /// y[i] = 1/x[i] for n elements
+    pub fn vvrecf(y: *mut f32, x: *const f32, n: *const c_int);
+
+    // ── Matrix operations ──────────────────────────────────────────
+
+    /// Transpose an M×N matrix A into N×M matrix C.
+    pub fn vDSP_mtrans(
+        a: *const f32, ia: Stride,
+        c: *mut f32, ic: Stride,
+        m: Length, n: Length,
+    );
+
+    /// Sum of squares: result = sum(A[i]^2)
+    pub fn vDSP_svesq(
+        a: *const f32, ia: Stride,
+        result: *mut f32,
+        n: Length,
+    );
+
+    /// In-place scale: X *= alpha
+    pub fn cblas_sscal(n: c_int, alpha: f32, x: *mut f32, incx: c_int);
+
     // ── BLAS ───────────────────────────────────────────────────────
 
     /// C = alpha * op(A) @ op(B) + beta * C
@@ -186,6 +208,48 @@ pub fn rsqrtf(a: &[f32], out: &mut [f32]) {
 pub fn tanhf(a: &[f32], out: &mut [f32]) {
     let n = a.len().min(out.len()) as c_int;
     unsafe { vvtanhf(out.as_mut_ptr(), a.as_ptr(), &n) }
+}
+
+/// Element-wise reciprocal: out[i] = 1/a[i]
+pub fn recf(a: &[f32], out: &mut [f32]) {
+    let n = a.len().min(out.len()) as c_int;
+    unsafe { vvrecf(out.as_mut_ptr(), a.as_ptr(), &n) }
+}
+
+/// Matrix transpose: C[n,m] = A[m,n]^T
+/// A is m rows × n cols, C is n rows × m cols.
+pub fn mtrans(a: &[f32], a_cols: usize, c: &mut [f32], c_cols: usize, m: usize, n: usize) {
+    assert!(a.len() >= m * n, "mtrans: a too small ({} < {})", a.len(), m * n);
+    assert!(c.len() >= n * m, "mtrans: c too small ({} < {})", c.len(), n * m);
+    assert_eq!(a_cols, n, "mtrans: a_cols must equal n");
+    assert_eq!(c_cols, m, "mtrans: c_cols must equal m");
+    unsafe { vDSP_mtrans(a.as_ptr(), 1, c.as_mut_ptr(), 1, n as Length, m as Length) }
+}
+
+/// Sum of squares with stride: result = sum(a[i*stride]^2 for i in 0..n)
+pub fn svesq_strided(a: &[f32], offset: usize, stride: usize, n: usize) -> f32 {
+    let mut result: f32 = 0.0;
+    if n > 0 {
+        unsafe { vDSP_svesq(a.as_ptr().add(offset), stride as Stride, &mut result, n as Length) }
+    }
+    result
+}
+
+/// Sum of squares (contiguous): result = sum(a[i]^2)
+pub fn svesq(a: &[f32]) -> f32 {
+    let mut result: f32 = 0.0;
+    if !a.is_empty() {
+        unsafe { vDSP_svesq(a.as_ptr(), 1, &mut result, a.len() as Length) }
+    }
+    result
+}
+
+/// In-place scale: v *= scalar (uses cblas_sscal)
+pub fn sscal(v: &mut [f32], scalar: f32) {
+    let n = v.len();
+    if n > 0 {
+        unsafe { cblas_sscal(n as c_int, scalar, v.as_mut_ptr(), 1) }
+    }
 }
 
 // CBLAS constants

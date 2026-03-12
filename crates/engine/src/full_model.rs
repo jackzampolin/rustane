@@ -147,13 +147,9 @@ pub fn forward(
     // 1. Embedding lookup → x [DIM, SEQ] (channel-first)
     let mut x_row = vec![0.0f32; seq * dim]; // [SEQ, DIM] row-major
     embedding::forward(&weights.embed, dim, tokens, &mut x_row);
-    // Transpose to channel-first: x[c, s] = x_row[s * dim + c]
+    // Transpose to channel-first [DIM, SEQ] via vDSP_mtrans
     let mut x = vec![0.0f32; dim * seq];
-    for s in 0..seq {
-        for c in 0..dim {
-            x[c * seq + s] = x_row[s * dim + c];
-        }
-    }
+    vdsp::mtrans(&x_row, dim, &mut x, seq, seq, dim);
 
     // 2. Forward through NL layers
     let mut caches = Vec::with_capacity(cfg.nlayers);
@@ -163,23 +159,21 @@ pub fn forward(
         x = x_next;
     }
 
-    // 3. Final RMSNorm (CPU) — save pre-norm x for backward
-    let x_prenorm = x; // move (layer loop is done, x not needed after)
+    // 3. Final RMSNorm (CPU) — bulk transpose + batch process
+    let x_prenorm = x;
     let mut x_final = vec![0.0f32; dim * seq];
     let mut rms_inv_final = vec![0.0f32; seq];
-    let mut x_pos = vec![0.0f32; dim];
-    let mut out_pos = vec![0.0f32; dim];
-    for s in 0..seq {
-        for c in 0..dim { x_pos[c] = x_prenorm[c * seq + s]; }
-        rms_inv_final[s] = rmsnorm::forward(&x_pos, &weights.gamma_final, &mut out_pos);
-        for c in 0..dim { x_final[c * seq + s] = out_pos[c]; }
+    {
+        let mut x_t = vec![0.0f32; seq * dim];
+        let mut xfinal_t = vec![0.0f32; seq * dim];
+        vdsp::mtrans(&x_prenorm, seq, &mut x_t, dim, dim, seq);
+        rmsnorm::forward_batch(&x_t, &weights.gamma_final, &mut xfinal_t, &mut rms_inv_final, dim, seq);
+        vdsp::mtrans(&xfinal_t, dim, &mut x_final, seq, seq, dim);
     }
 
     // 4. Logits: x_final^T @ embed^T → [SEQ, VOCAB]
     let mut x_final_row = vec![0.0f32; seq * dim];
-    for s in 0..seq {
-        for c in 0..dim { x_final_row[s * dim + c] = x_final[c * seq + s]; }
-    }
+    vdsp::mtrans(&x_final, seq, &mut x_final_row, dim, dim, seq);
     let mut logits = vec![0.0f32; seq * vocab];
     vdsp::sgemm_at(&x_final_row, seq, dim, &weights.embed, vocab, &mut logits);
 
@@ -188,27 +182,24 @@ pub fn forward(
         let inv_cap = 1.0 / softcap;
         let mut scaled = vec![0.0f32; seq * vocab];
         vdsp::vsmul(&logits, inv_cap, &mut scaled);
-        vdsp::tanhf(&scaled, &mut logits);
-        let mut capped = vec![0.0f32; seq * vocab];
-        vdsp::vsmul(&logits, softcap, &mut capped);
-        logits.copy_from_slice(&capped);
-        logits.clone() // save capped logits for softcap backward
+        vdsp::tanhf(&scaled, &mut logits);        // logits = tanh(logits/softcap)
+        vdsp::sscal(&mut logits, softcap);         // logits *= softcap (in-place)
+        logits.clone()
     } else {
         Vec::new()
     };
 
-    // 6. Cross-entropy loss (per-token, averaged)
+    // 6. Cross-entropy loss (per-token, averaged) — write directly into dlogits slice
     let mut total_loss = 0.0f32;
     let mut dlogits = vec![0.0f32; seq * vocab];
+    let inv_seq = 1.0 / seq as f32;
     for s in 0..seq {
         let tok_logits = &logits[s * vocab..(s + 1) * vocab];
         let (loss, log_sm) = cross_entropy::forward(tok_logits, targets[s] as usize);
         total_loss += loss;
-        let mut d_tok = vec![0.0f32; vocab];
-        cross_entropy::backward(&log_sm, targets[s] as usize, &mut d_tok);
-        for v in 0..vocab {
-            dlogits[s * vocab + v] = d_tok[v] / seq as f32;
-        }
+        let d_tok = &mut dlogits[s * vocab..(s + 1) * vocab];
+        cross_entropy::backward(&log_sm, targets[s] as usize, d_tok);
+        vdsp::sscal(d_tok, inv_seq);
     }
 
     ForwardResult {
@@ -242,11 +233,11 @@ pub fn backward(
     vdsp::vsmul(&fwd.dlogits, loss_scale, &mut dl);
 
     // 2. Softcap backward: dl *= (1 - tanh²(raw/softcap))
-    //    tanh(raw/softcap) = capped/softcap
+    //    Scalar loop: better cache locality than 5 vDSP passes over 16MB data
     if softcap > 0.0 && !fwd.logits_capped.is_empty() {
         let inv_cap = 1.0 / softcap;
         for i in 0..dl.len() {
-            let t = fwd.logits_capped[i] * inv_cap; // tanh value
+            let t = fwd.logits_capped[i] * inv_cap;
             dl[i] *= 1.0 - t * t;
         }
     }
@@ -255,9 +246,7 @@ pub fn backward(
     //    dembed += dl^T @ x_final_row: [VOCAB, SEQ]^T @ [SEQ, DIM] → [VOCAB, DIM]
     //    dx_final_row = dl @ embed: [SEQ, VOCAB] @ [VOCAB, DIM] → [SEQ, DIM]
     let mut x_final_row = vec![0.0f32; seq * dim];
-    for s in 0..seq {
-        for c in 0..dim { x_final_row[s * dim + c] = fwd.x_final[c * seq + s]; }
-    }
+    vdsp::mtrans(&fwd.x_final, seq, &mut x_final_row, dim, dim, seq);
     // dembed += dl^T @ x_final_row (accumulate with beta=1.0)
     unsafe {
         vdsp::cblas_sgemm(
@@ -286,25 +275,21 @@ pub fn backward(
 
     // Transpose dx_final to channel-first
     let mut dx_final = vec![0.0f32; dim * seq];
-    for s in 0..seq {
-        for c in 0..dim { dx_final[c * seq + s] = dx_final_row[s * dim + c]; }
-    }
+    vdsp::mtrans(&dx_final_row, dim, &mut dx_final, seq, seq, dim);
 
-    // 4. Final RMSNorm backward (CPU)
+    // 4. Final RMSNorm backward (CPU) — bulk transpose + batch
     let mut dy = vec![0.0f32; dim * seq];
-    let mut dx_pos_buf = vec![0.0f32; dim];
-    let mut x_pos_buf = vec![0.0f32; dim];
-    let mut dy_pos = vec![0.0f32; dim];
-    for s in 0..seq {
-        for c in 0..dim {
-            dx_pos_buf[c] = dx_final[c * seq + s];
-            x_pos_buf[c] = fwd.x_prenorm[c * seq + s];
-        }
-        rmsnorm::backward(
-            &dx_pos_buf, &x_pos_buf, &weights.gamma_final,
-            fwd.rms_inv_final[s], &mut dy_pos, &mut grads.dgamma_final,
+    {
+        let mut dx_final_t = vec![0.0f32; seq * dim];
+        let mut x_prenorm_t = vec![0.0f32; seq * dim];
+        let mut dy_t = vec![0.0f32; seq * dim];
+        vdsp::mtrans(&dx_final, seq, &mut dx_final_t, dim, dim, seq);
+        vdsp::mtrans(&fwd.x_prenorm, seq, &mut x_prenorm_t, dim, dim, seq);
+        rmsnorm::backward_batch(
+            &dx_final_t, &x_prenorm_t, &weights.gamma_final, &fwd.rms_inv_final,
+            &mut dy_t, &mut grads.dgamma_final, dim, seq,
         );
-        for c in 0..dim { dy[c * seq + s] = dy_pos[c]; }
+        vdsp::mtrans(&dy_t, dim, &mut dy, seq, seq, dim);
     }
 
     // 5. Backward through NL layers (reverse order)
@@ -314,9 +299,7 @@ pub fn backward(
 
     // 6. Input embedding backward: scatter-add dy into dembed
     let mut dy_row = vec![0.0f32; seq * dim];
-    for s in 0..seq {
-        for c in 0..dim { dy_row[s * dim + c] = dy[c * seq + s]; }
-    }
+    vdsp::mtrans(&dy, seq, &mut dy_row, dim, dim, seq);
     embedding::backward(&dy_row, dim, tokens, &mut grads.dembed);
 }
 
@@ -367,54 +350,55 @@ pub fn update_weights(
     batch.execute();
 }
 
-fn sum_sq(v: &[f32], scratch: &mut Vec<f32>) -> f32 {
-    if scratch.len() < v.len() { scratch.resize(v.len(), 0.0); }
-    vdsp::vmul(v, v, &mut scratch[..v.len()]);
-    vdsp::sve(&scratch[..v.len()])
+/// Scale all gradient tensors by a scalar (single pass, in-place).
+fn scale_all_grads(grads: &mut ModelGrads, scale: f32) {
+    vdsp::sscal(&mut grads.dembed, scale);
+    vdsp::sscal(&mut grads.dgamma_final, scale);
+    for lg in &mut grads.layers {
+        vdsp::sscal(&mut lg.dwq, scale);
+        vdsp::sscal(&mut lg.dwk, scale);
+        vdsp::sscal(&mut lg.dwv, scale);
+        vdsp::sscal(&mut lg.dwo, scale);
+        vdsp::sscal(&mut lg.dw1, scale);
+        vdsp::sscal(&mut lg.dw3, scale);
+        vdsp::sscal(&mut lg.dw2, scale);
+        vdsp::sscal(&mut lg.dgamma1, scale);
+        vdsp::sscal(&mut lg.dgamma2, scale);
+    }
 }
 
-/// Global gradient L2 norm.
+/// Global gradient L2 norm (uses vDSP_svesq — single call per tensor, no scratch).
 pub fn grad_norm(grads: &ModelGrads) -> f32 {
-    let mut scratch = Vec::new();
     let mut sum = 0.0f32;
-    sum += sum_sq(&grads.dembed, &mut scratch);
-    sum += sum_sq(&grads.dgamma_final, &mut scratch);
+    sum += vdsp::svesq(&grads.dembed);
+    sum += vdsp::svesq(&grads.dgamma_final);
     for lg in &grads.layers {
         for g in [&lg.dwq, &lg.dwk, &lg.dwv, &lg.dwo, &lg.dw1, &lg.dw3, &lg.dw2, &lg.dgamma1, &lg.dgamma2] {
-            sum += sum_sq(g, &mut scratch);
+            sum += vdsp::svesq(g);
         }
     }
     sum.sqrt()
 }
 
-/// Clip all gradients by global L2 norm.
+/// Clip all gradients by global L2 norm (in-place cblas_sscal, no scratch allocs).
 pub fn clip_grads(grads: &mut ModelGrads, max_norm: f32) {
     let norm = grad_norm(grads);
     if norm > max_norm {
         let scale = max_norm / norm;
-        let mut scratch = Vec::new();
-        scale_vec(&mut grads.dembed, scale, &mut scratch);
-        scale_vec(&mut grads.dgamma_final, scale, &mut scratch);
+        vdsp::sscal(&mut grads.dembed, scale);
+        vdsp::sscal(&mut grads.dgamma_final, scale);
         for lg in &mut grads.layers {
-            scale_vec(&mut lg.dwq, scale, &mut scratch);
-            scale_vec(&mut lg.dwk, scale, &mut scratch);
-            scale_vec(&mut lg.dwv, scale, &mut scratch);
-            scale_vec(&mut lg.dwo, scale, &mut scratch);
-            scale_vec(&mut lg.dw1, scale, &mut scratch);
-            scale_vec(&mut lg.dw3, scale, &mut scratch);
-            scale_vec(&mut lg.dw2, scale, &mut scratch);
-            scale_vec(&mut lg.dgamma1, scale, &mut scratch);
-            scale_vec(&mut lg.dgamma2, scale, &mut scratch);
+            vdsp::sscal(&mut lg.dwq, scale);
+            vdsp::sscal(&mut lg.dwk, scale);
+            vdsp::sscal(&mut lg.dwv, scale);
+            vdsp::sscal(&mut lg.dwo, scale);
+            vdsp::sscal(&mut lg.dw1, scale);
+            vdsp::sscal(&mut lg.dw3, scale);
+            vdsp::sscal(&mut lg.dw2, scale);
+            vdsp::sscal(&mut lg.dgamma1, scale);
+            vdsp::sscal(&mut lg.dgamma2, scale);
         }
     }
-}
-
-fn scale_vec(v: &mut [f32], s: f32, scratch: &mut Vec<f32>) {
-    if scratch.len() < v.len() {
-        scratch.resize(v.len(), 0.0);
-    }
-    vdsp::vsmul(v, s, &mut scratch[..v.len()]);
-    v.copy_from_slice(&scratch[..v.len()]);
 }
 
 /// Simple LCG pseudo-random (same as layer.rs).
@@ -464,25 +448,17 @@ pub fn train_step(
         );
     }
 
-    // Scale gradients: 1 / (accum_steps * loss_scale)
+    // Fused gradient scale + clip (single pass instead of two)
+    // Compute raw norm, then apply combined scale in one pass over 192MB
     let gsc = 1.0 / (tc.accum_steps as f32 * tc.loss_scale);
-    let mut scratch = Vec::new();
-    scale_vec(&mut grads.dembed, gsc, &mut scratch);
-    scale_vec(&mut grads.dgamma_final, gsc, &mut scratch);
-    for lg in &mut grads.layers {
-        scale_vec(&mut lg.dwq, gsc, &mut scratch);
-        scale_vec(&mut lg.dwk, gsc, &mut scratch);
-        scale_vec(&mut lg.dwv, gsc, &mut scratch);
-        scale_vec(&mut lg.dwo, gsc, &mut scratch);
-        scale_vec(&mut lg.dw1, gsc, &mut scratch);
-        scale_vec(&mut lg.dw3, gsc, &mut scratch);
-        scale_vec(&mut lg.dw2, gsc, &mut scratch);
-        scale_vec(&mut lg.dgamma1, gsc, &mut scratch);
-        scale_vec(&mut lg.dgamma2, gsc, &mut scratch);
-    }
-
-    // Gradient clipping
-    clip_grads(grads, tc.grad_clip);
+    let raw_norm = grad_norm(grads);
+    let scaled_norm = raw_norm * gsc;
+    let combined_scale = if scaled_norm > tc.grad_clip {
+        tc.grad_clip / raw_norm // scale + clip in one
+    } else {
+        gsc // just scale
+    };
+    scale_all_grads(grads, combined_scale);
 
     // LR schedule
     let lr = learning_rate(step, tc);
@@ -510,9 +486,7 @@ pub fn forward_losses(
     let mut x_row = vec![0.0f32; seq * dim];
     embedding::forward(&weights.embed, dim, tokens, &mut x_row);
     let mut x = vec![0.0f32; dim * seq];
-    for s in 0..seq {
-        for c in 0..dim { x[c * seq + s] = x_row[s * dim + c]; }
-    }
+    vdsp::mtrans(&x_row, dim, &mut x, seq, seq, dim);
 
     // Layers
     for l in 0..cfg.nlayers {
@@ -520,21 +494,20 @@ pub fn forward_losses(
         x = x_next;
     }
 
-    // Final RMSNorm
+    // Final RMSNorm — bulk transpose + batch
     let mut x_final = vec![0.0f32; dim * seq];
-    let mut x_pos = vec![0.0f32; dim];
-    let mut out_pos = vec![0.0f32; dim];
-    for s in 0..seq {
-        for c in 0..dim { x_pos[c] = x[c * seq + s]; }
-        rmsnorm::forward(&x_pos, &weights.gamma_final, &mut out_pos);
-        for c in 0..dim { x_final[c * seq + s] = out_pos[c]; }
+    {
+        let mut x_t = vec![0.0f32; seq * dim];
+        let mut xfinal_t = vec![0.0f32; seq * dim];
+        let mut rms_inv = vec![0.0f32; seq];
+        vdsp::mtrans(&x, seq, &mut x_t, dim, dim, seq);
+        rmsnorm::forward_batch(&x_t, &weights.gamma_final, &mut xfinal_t, &mut rms_inv, dim, seq);
+        vdsp::mtrans(&xfinal_t, dim, &mut x_final, seq, seq, dim);
     }
 
     // Logits
     let mut x_final_row = vec![0.0f32; seq * dim];
-    for s in 0..seq {
-        for c in 0..dim { x_final_row[s * dim + c] = x_final[c * seq + s]; }
-    }
+    vdsp::mtrans(&x_final, seq, &mut x_final_row, dim, dim, seq);
     let mut logits = vec![0.0f32; seq * vocab];
     vdsp::sgemm_at(&x_final_row, seq, dim, &weights.embed, vocab, &mut logits);
 
