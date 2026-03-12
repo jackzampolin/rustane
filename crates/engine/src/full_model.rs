@@ -4,7 +4,7 @@
 //! Tied embedding weights (embedding table = output projection transposed).
 
 use crate::cpu::{rmsnorm, cross_entropy, embedding, vdsp};
-use crate::layer::{self, CompiledKernels, LayerWeights, LayerGrads, ForwardCache};
+use crate::layer::{self, CompiledKernels, LayerWeights, LayerGrads, ForwardCache, LayerScratch};
 use crate::model::ModelConfig;
 use crate::training::LayerOptState;
 use crate::cpu::adam::{self, AdamConfig};
@@ -156,9 +156,10 @@ pub fn forward(
     }
 
     // 2. Forward through NL layers
+    let mut scratch = LayerScratch::allocate(cfg);
     let mut caches = Vec::with_capacity(cfg.nlayers);
     for l in 0..cfg.nlayers {
-        let (x_next, cache) = layer::forward(cfg, kernels, &weights.layers[l], &x);
+        let (x_next, cache) = layer::forward(cfg, kernels, &weights.layers[l], &x, &mut scratch);
         caches.push(cache);
         x = x_next;
     }
@@ -308,8 +309,9 @@ pub fn backward(
     }
 
     // 5. Backward through NL layers (reverse order)
+    let mut scratch = LayerScratch::allocate(cfg);
     for l in (0..cfg.nlayers).rev() {
-        dy = layer::backward(cfg, kernels, &weights.layers[l], &fwd.caches[l], &dy, &mut grads.layers[l]);
+        dy = layer::backward(cfg, kernels, &weights.layers[l], &fwd.caches[l], &dy, &mut grads.layers[l], &mut scratch);
     }
 
     // 6. Input embedding backward: scatter-add dy into dembed
@@ -373,14 +375,21 @@ pub fn update_weights(
     }
 }
 
+fn sum_sq(v: &[f32], scratch: &mut Vec<f32>) -> f32 {
+    if scratch.len() < v.len() { scratch.resize(v.len(), 0.0); }
+    vdsp::vmul(v, v, &mut scratch[..v.len()]);
+    vdsp::sve(&scratch[..v.len()])
+}
+
 /// Global gradient L2 norm.
 pub fn grad_norm(grads: &ModelGrads) -> f32 {
+    let mut scratch = Vec::new();
     let mut sum = 0.0f32;
-    sum += vdsp::sve(&grads.dembed.iter().map(|x| x * x).collect::<Vec<_>>());
-    sum += vdsp::sve(&grads.dgamma_final.iter().map(|x| x * x).collect::<Vec<_>>());
+    sum += sum_sq(&grads.dembed, &mut scratch);
+    sum += sum_sq(&grads.dgamma_final, &mut scratch);
     for lg in &grads.layers {
         for g in [&lg.dwq, &lg.dwk, &lg.dwv, &lg.dwo, &lg.dw1, &lg.dw3, &lg.dw2, &lg.dgamma1, &lg.dgamma2] {
-            sum += vdsp::sve(&g.iter().map(|x| x * x).collect::<Vec<_>>());
+            sum += sum_sq(g, &mut scratch);
         }
     }
     sum.sqrt()
@@ -513,8 +522,9 @@ pub fn forward_losses(
     }
 
     // Layers
+    let mut scratch = LayerScratch::allocate(cfg);
     for l in 0..cfg.nlayers {
-        let (x_next, _) = layer::forward(cfg, kernels, &weights.layers[l], &x);
+        let (x_next, _) = layer::forward(cfg, kernels, &weights.layers[l], &x, &mut scratch);
         x = x_next;
     }
 
