@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/ane-bridge",
     "crates/metal-decode",
@@ -9,4 +9,25 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.94.0"
 license = "MIT"
+
+[workspace.dependencies]
+ane = { path = "../ane-crate/crates/ane" }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSObjCRuntime"] }
+objc2-io-surface = { version = "0.3", features = ["IOSurfaceRef", "IOSurfaceTypes", "objc2", "objc2-foundation", "objc2-core-foundation", "libc"] }
+objc2-core-foundation = "0.3"
+half = "2"
+libc = "0.2"
+thiserror = "2.0"
+memmap2 = "0.9"
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLLibrary", "MTLResource", "MTLBuffer", "MTLTypes"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[profile.test]
+opt-level = 1
