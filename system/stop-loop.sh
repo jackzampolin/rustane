@@ -11,8 +11,8 @@ STOPFILE="/tmp/rustane-opt-STOP"
 
 if [[ "${1:-}" == "--now" ]]; then
     echo "Killing optimization loop immediately..."
-    # Kill any running claude headless processes in worktrees
-    pkill -f "claude.*dangerously-skip-permissions" 2>/dev/null && echo "  Killed claude process" || echo "  No claude process found"
+    # Kill only the AGENT's claude process (matches on agent ID in prompt), not interactive sessions
+    pkill -f "Your agent ID is:" 2>/dev/null && echo "  Killed agent claude process" || echo "  No agent claude process found"
     # Kill the loop script itself
     pkill -f "optimize-loop.sh" 2>/dev/null && echo "  Killed loop script" || echo "  No loop script found"
     # Also touch stop file in case anything respawns
