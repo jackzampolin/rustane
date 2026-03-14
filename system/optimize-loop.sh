@@ -238,6 +238,16 @@ ANY reduction in ms/step is valuable and worth committing — even 2-3ms wins co
 TIME LIMIT: You have %%TIMEOUT%%min for this iteration. Focus on ONE experiment.
 If implementation is taking too long, simplify or log as PLANNED and exit.
 
+STATUS FILE: Update /tmp/rustane-status-%%AGENT_ID%% at each phase so the operator can monitor:
+  echo "READING" > /tmp/rustane-status-%%AGENT_ID%%           # start of iteration
+  echo "CLAIMED: <name>" > /tmp/rustane-status-%%AGENT_ID%%   # after picking experiment
+  echo "IMPLEMENTING" > /tmp/rustane-status-%%AGENT_ID%%      # writing code
+  echo "TESTING" > /tmp/rustane-status-%%AGENT_ID%%           # running tests
+  echo "BENCHMARKING" > /tmp/rustane-status-%%AGENT_ID%%      # measuring performance
+  echo "LOGGING" > /tmp/rustane-status-%%AGENT_ID%%           # writing results
+  echo "DONE: <verdict> <ms>" > /tmp/rustane-status-%%AGENT_ID%%  # finished
+Do this BEFORE each step — it costs nothing and lets the operator see progress.
+
 STEP 1 — READ CONTEXT (do this first, do not skip):
   - dev/CURRENT.md (current project state, what works, what's broken)
   - system/experiments.tsv (every experiment tried, results, verdicts)
