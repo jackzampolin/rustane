@@ -239,13 +239,15 @@ TIME LIMIT: You have %%TIMEOUT%%min for this iteration. Focus on ONE experiment.
 If implementation is taking too long, simplify or log as PLANNED and exit.
 
 STATUS FILE: Update /tmp/rustane-status-%%AGENT_ID%% at each phase so the operator can monitor:
-  echo "READING" > /tmp/rustane-status-%%AGENT_ID%%           # start of iteration
-  echo "CLAIMED: <name>" > /tmp/rustane-status-%%AGENT_ID%%   # after picking experiment
-  echo "IMPLEMENTING" > /tmp/rustane-status-%%AGENT_ID%%      # writing code
-  echo "TESTING" > /tmp/rustane-status-%%AGENT_ID%%           # running tests
-  echo "BENCHMARKING" > /tmp/rustane-status-%%AGENT_ID%%      # measuring performance
-  echo "LOGGING" > /tmp/rustane-status-%%AGENT_ID%%           # writing results
-  echo "DONE: <verdict> <ms>" > /tmp/rustane-status-%%AGENT_ID%%  # finished
+  echo "READING" > /tmp/rustane-status-%%AGENT_ID%%              # reading context files
+  echo "CLAIMED: <name>" > /tmp/rustane-status-%%AGENT_ID%%      # picked experiment
+  echo "CODING" > /tmp/rustane-status-%%AGENT_ID%%               # writing implementation
+  echo "CODING: <file>" > /tmp/rustane-status-%%AGENT_ID%%       # writing specific file
+  echo "TESTING" > /tmp/rustane-status-%%AGENT_ID%%              # running cargo test
+  echo "TEST_COMPLETE" > /tmp/rustane-status-%%AGENT_ID%%        # tests passed/failed
+  echo "BENCHMARKING" > /tmp/rustane-status-%%AGENT_ID%%         # running benchmarks
+  echo "LOGGING" > /tmp/rustane-status-%%AGENT_ID%%              # writing experiments.tsv
+  echo "DONE: <verdict> <ms>" > /tmp/rustane-status-%%AGENT_ID%% # finished
 Do this BEFORE each step — it costs nothing and lets the operator see progress.
 
 STEP 1 — READ CONTEXT (do this first, do not skip):
