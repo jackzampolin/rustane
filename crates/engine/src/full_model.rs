@@ -471,8 +471,9 @@ pub fn backward(
 }
 
 /// Apply Adam to all model weights with split learning rates.
-/// Batches all 56 parameter updates into a single Metal GPU command buffer.
-/// `grad_scale` is applied to gradients inline on GPU (fused descale+clip).
+/// Uses 2-thread parallelism: step_fused is compute-bound (sqrt+div per element),
+/// and single-threaded achieves only ~80 GB/s of M4 Max's 400 GB/s bandwidth.
+/// `grad_scale` is applied to gradients inline (fused descale+clip).
 /// Pass 1.0 for no scaling, or the combined descale/clip factor.
 pub fn update_weights(
     cfg: &ModelConfig,
@@ -492,37 +493,65 @@ pub fn update_weights(
     let embed_lr = lr * tc.embed_lr_scale;
     let (b1, b2, eps) = (tc.beta1, tc.beta2, tc.eps);
 
-    // CPU fused Adam: single-pass per tensor, no Metal buffer overhead.
-    // Each element is read once and written once (~28 bytes/elem vs Metal's ~16ms of
-    // driver overhead for 56 separate GPU dispatches).
+    let mid = cfg.nlayers / 2; // 3 for 6 layers
 
-    // Embedding (no weight decay)
-    step_fused(&mut weights.embed, &grads.dembed, &mut opt.embed_m, &mut opt.embed_v,
-               t, embed_lr, b1, b2, eps, 0.0, grad_scale);
+    // Destructure into independent borrows for safe parallel access.
+    let ModelWeights { embed: ref mut w_embed, layers: ref mut w_layers, gamma_final: ref mut w_gf } = *weights;
+    let ModelGrads { dembed: ref g_embed, layers: ref g_layers, dgamma_final: ref g_gf } = *grads;
+    let ModelOptState {
+        embed_m: ref mut o_em, embed_v: ref mut o_ev,
+        layers: ref mut o_layers,
+        gamma_final_m: ref mut o_gfm, gamma_final_v: ref mut o_gfv,
+    } = *opt;
 
-    // Final RMSNorm (no weight decay)
-    step_fused(&mut weights.gamma_final, &grads.dgamma_final, &mut opt.gamma_final_m, &mut opt.gamma_final_v,
-               t, lr, b1, b2, eps, 0.0, grad_scale);
+    let (wl_lo, wl_hi) = w_layers.split_at_mut(mid);
+    let (gl_lo, gl_hi) = g_layers.split_at(mid);
+    let (ol_lo, ol_hi) = o_layers.split_at_mut(mid);
 
-    // Per-layer
-    for l in 0..cfg.nlayers {
-        let w = &mut weights.layers[l];
-        let g = &grads.layers[l];
-        let o = &mut opt.layers[l];
+    // Thread 1 (spawned): embed + gamma_final + layers 0..mid (~25M elements)
+    // Thread 2 (main):     layers mid..nlayers (~19M elements)
+    // Imbalance is ~57/43 — embed (6.3M) can't be split further.
+    std::thread::scope(|s| {
+        let handle = s.spawn(move || {
+            // Embedding (no weight decay)
+            step_fused(w_embed, g_embed, o_em, o_ev, t, embed_lr, b1, b2, eps, 0.0, grad_scale);
+            // Final RMSNorm (no weight decay)
+            step_fused(w_gf, g_gf, o_gfm, o_gfv, t, lr, b1, b2, eps, 0.0, grad_scale);
+            // First half of layers
+            for l in 0..wl_lo.len() {
+                let w = &mut wl_lo[l];
+                let g = &gl_lo[l];
+                let o = &mut ol_lo[l];
+                step_fused(&mut w.wq, &g.dwq, &mut o.m_wq, &mut o.v_wq, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+                step_fused(&mut w.wk, &g.dwk, &mut o.m_wk, &mut o.v_wk, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+                step_fused(&mut w.wv, &g.dwv, &mut o.m_wv, &mut o.v_wv, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+                step_fused(&mut w.wo, &g.dwo, &mut o.m_wo, &mut o.v_wo, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+                step_fused(&mut w.w1, &g.dw1, &mut o.m_w1, &mut o.v_w1, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+                step_fused(&mut w.w3, &g.dw3, &mut o.m_w3, &mut o.v_w3, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+                step_fused(&mut w.w2, &g.dw2, &mut o.m_w2, &mut o.v_w2, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+                step_fused(&mut w.gamma1, &g.dgamma1, &mut o.m_gamma1, &mut o.v_gamma1, t, lr, b1, b2, eps, 0.0, grad_scale);
+                step_fused(&mut w.gamma2, &g.dgamma2, &mut o.m_gamma2, &mut o.v_gamma2, t, lr, b1, b2, eps, 0.0, grad_scale);
+            }
+        });
 
-        // Weight matrices
-        step_fused(&mut w.wq, &g.dwq, &mut o.m_wq, &mut o.v_wq, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-        step_fused(&mut w.wk, &g.dwk, &mut o.m_wk, &mut o.v_wk, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-        step_fused(&mut w.wv, &g.dwv, &mut o.m_wv, &mut o.v_wv, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-        step_fused(&mut w.wo, &g.dwo, &mut o.m_wo, &mut o.v_wo, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-        step_fused(&mut w.w1, &g.dw1, &mut o.m_w1, &mut o.v_w1, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-        step_fused(&mut w.w3, &g.dw3, &mut o.m_w3, &mut o.v_w3, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-        step_fused(&mut w.w2, &g.dw2, &mut o.m_w2, &mut o.v_w2, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+        // Main thread: second half of layers
+        for l in 0..wl_hi.len() {
+            let w = &mut wl_hi[l];
+            let g = &gl_hi[l];
+            let o = &mut ol_hi[l];
+            step_fused(&mut w.wq, &g.dwq, &mut o.m_wq, &mut o.v_wq, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+            step_fused(&mut w.wk, &g.dwk, &mut o.m_wk, &mut o.v_wk, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+            step_fused(&mut w.wv, &g.dwv, &mut o.m_wv, &mut o.v_wv, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+            step_fused(&mut w.wo, &g.dwo, &mut o.m_wo, &mut o.v_wo, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+            step_fused(&mut w.w1, &g.dw1, &mut o.m_w1, &mut o.v_w1, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+            step_fused(&mut w.w3, &g.dw3, &mut o.m_w3, &mut o.v_w3, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+            step_fused(&mut w.w2, &g.dw2, &mut o.m_w2, &mut o.v_w2, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+            step_fused(&mut w.gamma1, &g.dgamma1, &mut o.m_gamma1, &mut o.v_gamma1, t, lr, b1, b2, eps, 0.0, grad_scale);
+            step_fused(&mut w.gamma2, &g.dgamma2, &mut o.m_gamma2, &mut o.v_gamma2, t, lr, b1, b2, eps, 0.0, grad_scale);
+        }
 
-        // RMSNorm scales (no weight decay)
-        step_fused(&mut w.gamma1, &g.dgamma1, &mut o.m_gamma1, &mut o.v_gamma1, t, lr, b1, b2, eps, 0.0, grad_scale);
-        step_fused(&mut w.gamma2, &g.dgamma2, &mut o.m_gamma2, &mut o.v_gamma2, t, lr, b1, b2, eps, 0.0, grad_scale);
-    }
+        handle.join().expect("Adam thread 1 panicked");
+    });
 }
 
 
