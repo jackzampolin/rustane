@@ -88,36 +88,43 @@ case "$ACTION" in
         ;;
 
     status|st)
-        echo "=== Optimization Loop Control ==="
+        echo "=== Optimization Loop Status ==="
         echo ""
+        # Agent status from status file
+        STATUSFILE="/tmp/rustane-status-alpha"
+        if [ -f "$STATUSFILE" ]; then
+            echo "Agent:   $(cat "$STATUSFILE")"
+        else
+            echo "Agent:   (no status file)"
+        fi
         # Process status
+        PIDFILE="/tmp/rustane-claude-alpha.pid"
+        if [ -f "$PIDFILE" ]; then
+            CPID=$(cat "$PIDFILE")
+            if kill -0 "$CPID" 2>/dev/null; then
+                CLAUDE_TIME=$(ps -o etime= -p "$CPID" 2>/dev/null | tr -d ' ')
+                echo "Claude:  RUNNING (PID=$CPID, elapsed=$CLAUDE_TIME)"
+            else
+                echo "Claude:  DEAD (stale PID=$CPID)"
+            fi
+        else
+            echo "Claude:  idle (no PID file)"
+        fi
         if pgrep -qf "optimize-loop.sh"; then
             echo "Loop:    RUNNING"
         else
             echo "Loop:    NOT RUNNING"
         fi
-        if pgrep -qf "claude.*dangerously-skip-permissions"; then
-            CLAUDE_PID=$(pgrep -f "claude.*dangerously-skip-permissions" 2>/dev/null | head -1)
-            CLAUDE_TIME=$(ps -o etime= -p "$CLAUDE_PID" 2>/dev/null | tr -d ' ')
-            echo "Claude:  RUNNING (PID=$CLAUDE_PID, elapsed=$CLAUDE_TIME)"
-        else
-            echo "Claude:  idle"
-        fi
         echo ""
         # Control files
         echo "Controls:"
-        [ -f "$STOPFILE" ]   && echo "  STOP:   SET (will stop after current iteration)" || echo "  STOP:   clear"
-        [ -f "$PAUSEFILE" ]  && echo "  PAUSE:  SET (loop is paused)" || echo "  PAUSE:  clear"
-        if [ -f "$INJECTFILE" ]; then
-            echo "  INJECT: SET — contents:"
-            sed 's/^/    /' "$INJECTFILE"
-        else
-            echo "  INJECT: clear"
-        fi
+        [ -f "$STOPFILE" ]   && echo "  STOP:   SET" || echo "  STOP:   clear"
+        [ -f "$PAUSEFILE" ]  && echo "  PAUSE:  SET" || echo "  PAUSE:  clear"
+        [ -f "$INJECTFILE" ] && echo "  INJECT: SET — $(cat "$INJECTFILE" | head -1)" || echo "  INJECT: clear"
         echo ""
         # Recent gossip
-        echo "--- Last 10 gossip entries ---"
-        tail -10 "$GOSSIPFILE" 2>/dev/null || echo "(no gossip)"
+        echo "--- Last 8 gossip entries ---"
+        tail -8 "$GOSSIPFILE" 2>/dev/null || echo "(no gossip)"
         ;;
 
     *)
