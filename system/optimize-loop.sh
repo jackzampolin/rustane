@@ -487,7 +487,6 @@ ${INJECT_CONTENT}"
     claude -p \
         --dangerously-skip-permissions \
         --model "$MODEL" \
-        --effort max \
         "$ITER_PROMPT" 2>&1 | tee -a "$LOGFILE"
     CLAUDE_EXIT=${PIPESTATUS[0]}
     set -e
