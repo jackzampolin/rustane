@@ -12,6 +12,7 @@
 #   ./system/optimize-loop.sh --dry-run                # print prompt, don't run
 #   ./system/optimize-loop.sh --model opus --iters 3   # 3 iters with opus
 #   ./system/optimize-loop.sh --id beta                # second agent (gossip-aware)
+#   ./system/optimize-loop.sh --base master            # branch off master instead of auto-max
 #   ./system/optimize-loop.sh --status                 # show current status and exit
 #
 # tmux (recommended):
@@ -35,6 +36,7 @@ MAX_ITERS=20
 COOLDOWN=10
 MODEL="claude-sonnet-4-6"
 AGENT_ID="alpha"
+BASE_BRANCH="auto-max"
 DRY_RUN=false
 SHOW_STATUS=false
 ITER_TIMEOUT_MIN=20   # minutes per iteration
@@ -53,6 +55,7 @@ while [[ $# -gt 0 ]]; do
         --target)    TARGET_MS="$2"; shift 2 ;;
         --timeout)   ITER_TIMEOUT_MIN="$2"; shift 2 ;;
         --id)        AGENT_ID="$2"; shift 2 ;;
+        --base)      BASE_BRANCH="$2"; shift 2 ;;
         *)           echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -175,17 +178,17 @@ if [ -d "$WORKTREE" ]; then
     git worktree remove --force "$WORKTREE" 2>/dev/null || rm -rf "$WORKTREE"
 fi
 
-# Create or rebase branch onto latest origin/master
+# Create or rebase branch onto latest origin/${BASE_BRANCH}
 if ! git -C "$REPO_ROOT" show-ref --quiet "refs/heads/${BRANCH}"; then
-    git -C "$REPO_ROOT" branch "$BRANCH" origin/master
-    log "Created branch ${BRANCH} from origin/master"
+    git -C "$REPO_ROOT" branch "$BRANCH" origin/${BASE_BRANCH}
+    log "Created branch ${BRANCH} from origin/${BASE_BRANCH}"
 else
-    log "Rebasing existing branch ${BRANCH} onto origin/master"
+    log "Rebasing existing branch ${BRANCH} onto origin/${BASE_BRANCH}"
     git -C "$REPO_ROOT" checkout "$BRANCH" --quiet
-    git -C "$REPO_ROOT" rebase origin/master --quiet || {
-        log "WARNING: rebase failed, resetting to origin/master"
+    git -C "$REPO_ROOT" rebase origin/${BASE_BRANCH} --quiet || {
+        log "WARNING: rebase failed, resetting to origin/${BASE_BRANCH}"
         git -C "$REPO_ROOT" rebase --abort 2>/dev/null || true
-        git -C "$REPO_ROOT" reset --hard origin/master --quiet
+        git -C "$REPO_ROOT" reset --hard origin/${BASE_BRANCH} --quiet
     }
     git -C "$REPO_ROOT" checkout - --quiet 2>/dev/null || true
 fi
