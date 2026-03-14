@@ -556,16 +556,33 @@ pub fn update_weights(
 
 
 /// Global gradient L2 norm (uses vDSP_svesq — single call per tensor, no scratch).
+/// Split across 2 threads: embed+gamma+layers[0..mid] on thread 1, layers[mid..] on main.
 pub fn grad_norm(grads: &ModelGrads) -> f32 {
-    let mut sum = 0.0f32;
-    sum += vdsp::svesq(&grads.dembed);
-    sum += vdsp::svesq(&grads.dgamma_final);
-    for lg in &grads.layers {
-        for g in [&lg.dwq, &lg.dwk, &lg.dwv, &lg.dwo, &lg.dw1, &lg.dw3, &lg.dw2, &lg.dgamma1, &lg.dgamma2] {
-            sum += vdsp::svesq(g);
+    let mid = grads.layers.len() / 2;
+    let (lo, hi) = grads.layers.split_at(mid);
+
+    let (sum1, sum2) = std::thread::scope(|s| {
+        let handle = s.spawn(|| {
+            let mut sum = vdsp::svesq(&grads.dembed);
+            sum += vdsp::svesq(&grads.dgamma_final);
+            for lg in lo {
+                for g in [&lg.dwq, &lg.dwk, &lg.dwv, &lg.dwo, &lg.dw1, &lg.dw3, &lg.dw2, &lg.dgamma1, &lg.dgamma2] {
+                    sum += vdsp::svesq(g);
+                }
+            }
+            sum
+        });
+
+        let mut sum = 0.0f32;
+        for lg in hi {
+            for g in [&lg.dwq, &lg.dwk, &lg.dwv, &lg.dwo, &lg.dw1, &lg.dw3, &lg.dw2, &lg.dgamma1, &lg.dgamma2] {
+                sum += vdsp::svesq(g);
+            }
         }
-    }
-    sum.sqrt()
+        (handle.join().expect("norm thread panicked"), sum)
+    });
+
+    (sum1 + sum2).sqrt()
 }
 
 /// Clip all gradients by global L2 norm (in-place cblas_sscal, no scratch allocs).
