@@ -674,6 +674,151 @@ pub fn forward_into(
     }
 }
 
+/// Pipelined forward: defers own h1/h3/gate readback, optionally reads previous
+/// layer's deferred h1/h3/gate during sdpaFwd ANE overlap (step 3).
+///
+/// The ffnFused output IOSurface retains the previous layer's data until this
+/// layer's ffnFused runs (~5ms later), giving ample time to read during step 3.
+/// sdpaFwd ANE takes ~3.2ms, CPU staging takes ~1.5ms → ~1.7ms spare for readback.
+/// The 12MB readback takes ~0.8ms, fitting within the spare window.
+pub fn forward_into_pipelined(
+    cfg: &ModelConfig,
+    kernels: &CompiledKernels,
+    weights: &LayerWeights,
+    x: &[f32],
+    cache: &mut ForwardCache,
+    x_next: &mut [f32],
+    prev_cache: Option<&mut ForwardCache>,
+) {
+    let dim = cfg.dim;
+    let seq = cfg.seq;
+    let q_dim = cfg.q_dim;
+    let kv_dim = cfg.kv_dim;
+    let hidden = cfg.hidden;
+    let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
+
+    cache.x.copy_from_slice(x);
+
+    // 1. RMSNorm1 (CPU)
+    rmsnorm::forward_channel_first(x, &weights.gamma1, &mut cache.xnorm, &mut cache.rms_inv1, dim, seq);
+
+    // 2. Stage sdpaFwd
+    let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
+    let sdpa_out_ch = sdpa_fwd::output_channels(cfg);
+    {
+        let mut locked = kernels.bufs.sdpa_fwd_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        for c in 0..dim {
+            let row = c * sdpa_sp;
+            buf[row..row + seq].copy_from_slice(&cache.xnorm[c * seq..c * seq + seq]);
+            buf[row + seq..row + seq + q_dim].copy_from_slice(&weights.wq[c * q_dim..c * q_dim + q_dim]);
+            let kv_off = seq + q_dim;
+            buf[row + kv_off..row + kv_off + kv_dim].copy_from_slice(&weights.wk[c * kv_dim..c * kv_dim + kv_dim]);
+            buf[row + kv_off + kv_dim..row + kv_off + 2 * kv_dim].copy_from_slice(&weights.wv[c * kv_dim..c * kv_dim + kv_dim]);
+        }
+    }
+
+    // 3. Run sdpaFwd (ANE) || pre-stage weights + deferred prev-layer cache readback
+    let wo_sp = dyn_matmul::spatial_width(seq, dim);
+    let ffn_sp = ffn_fused::input_spatial_width(cfg);
+    let ffn_out_ch = ffn_fused::output_channels(cfg);
+    std::thread::scope(|s| {
+        let ane_handle = s.spawn(|| {
+            kernels.sdpa_fwd.run(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
+        });
+        // Stage woFwd weights
+        {
+            let mut locked = kernels.bufs.wo_fwd_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, q_dim, wo_sp, &weights.wo, dim, seq);
+        }
+        // Stage ffnFused weights
+        {
+            let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            let w_off = 2 * seq;
+            for c in 0..dim {
+                let row = c * ffn_sp;
+                buf[row + w_off..row + w_off + hidden].copy_from_slice(&weights.w1[c * hidden..c * hidden + hidden]);
+                buf[row + w_off + hidden..row + w_off + 2 * hidden].copy_from_slice(&weights.w3[c * hidden..c * hidden + hidden]);
+                buf[row + w_off + 2 * hidden..row + w_off + 3 * hidden].copy_from_slice(&weights.w2[c * hidden..c * hidden + hidden]);
+            }
+        }
+        // Deferred readback: read PREVIOUS layer's h1/h3/gate from ffn_fused_out.
+        // This IOSurface still holds the previous layer's output (not yet overwritten).
+        // Safe: ffn_fused_out is not touched by sdpaFwd (which uses sdpa_fwd_in/out).
+        if let Some(prev) = prev_cache {
+            let locked = kernels.bufs.ffn_fused_out.as_f32_slice();
+            read_channels_into(&locked, ffn_out_ch, seq, dim, hidden, &mut prev.h1);
+            read_channels_into(&locked, ffn_out_ch, seq, dim + hidden, hidden, &mut prev.h3);
+            read_channels_into(&locked, ffn_out_ch, seq, dim + 2 * hidden, hidden, &mut prev.gate);
+        }
+        ane_handle.join().expect("ANE thread panicked");
+    });
+
+    // Extract sdpaFwd output
+    {
+        let locked = kernels.bufs.sdpa_fwd_out.as_f32_slice();
+        read_channels_into(&locked, sdpa_out_ch, seq, 0, q_dim, &mut cache.attn_out);
+        read_channels_into(&locked, sdpa_out_ch, seq, q_dim, q_dim, &mut cache.q_rope);
+        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim, kv_dim, &mut cache.k_rope);
+        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim + kv_dim, kv_dim, &mut cache.v);
+    }
+
+    // 4. Stage woFwd activations only
+    {
+        let mut locked = kernels.bufs.wo_fwd_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, q_dim, wo_sp, &cache.attn_out, seq, 0);
+    }
+
+    // 5. Run woFwd (ANE)
+    kernels.wo_fwd.run(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
+
+    {
+        let locked = kernels.bufs.wo_fwd_out.as_f32_slice();
+        cache.o_out.copy_from_slice(&locked[..dim * seq]);
+    }
+
+    // 6. Residual + RMSNorm2
+    vdsp::vsma(&cache.o_out, alpha, x, &mut cache.x2);
+    rmsnorm::forward_channel_first(&cache.x2, &weights.gamma2, &mut cache.x2norm, &mut cache.rms_inv2, dim, seq);
+
+    // 7. Stage ffnFused activations only
+    {
+        let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        for c in 0..dim {
+            let row = c * ffn_sp;
+            buf[row..row + seq].copy_from_slice(&cache.x2norm[c * seq..c * seq + seq]);
+            buf[row + seq..row + 2 * seq].copy_from_slice(&cache.x2[c * seq..c * seq + seq]);
+        }
+    }
+
+    // 8. Run ffnFused (ANE)
+    kernels.ffn_fused.run(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
+
+    // Extract x_next ONLY — h1/h3/gate deferred to next layer's step 3
+    {
+        let locked = kernels.bufs.ffn_fused_out.as_f32_slice();
+        read_channels_into(&locked, ffn_out_ch, seq, 0, dim, x_next);
+    }
+}
+
+/// Read deferred h1/h3/gate from ffnFused IOSurface into cache.
+/// Used for the last layer (no next layer to overlap with).
+pub fn read_ffn_cache(cfg: &ModelConfig, kernels: &CompiledKernels, cache: &mut ForwardCache) {
+    let dim = cfg.dim;
+    let seq = cfg.seq;
+    let hidden = cfg.hidden;
+    let ffn_out_ch = ffn_fused::output_channels(cfg);
+
+    let locked = kernels.bufs.ffn_fused_out.as_f32_slice();
+    read_channels_into(&locked, ffn_out_ch, seq, dim, hidden, &mut cache.h1);
+    read_channels_into(&locked, ffn_out_ch, seq, dim + hidden, hidden, &mut cache.h3);
+    read_channels_into(&locked, ffn_out_ch, seq, dim + 2 * hidden, hidden, &mut cache.gate);
+}
+
 /// Timing breakdown for forward pass.
 #[derive(Debug, Clone)]
 pub struct ForwardTimings {

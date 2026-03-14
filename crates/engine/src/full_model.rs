@@ -201,11 +201,20 @@ pub fn forward_ws(
     embedding::forward(&weights.embed, dim, tokens, &mut ws.x_row);
     vdsp::mtrans(&ws.x_row, dim, &mut ws.x_buf, seq, seq, dim);
 
-    // 2. Forward through NL layers (pre-allocated caches, zero allocs)
+    // 2. Forward through NL layers with pipelined ffnFused cache readback.
+    // Each layer defers its h1/h3/gate readback (12MB). The NEXT layer reads them
+    // during its sdpaFwd ANE overlap (step 3, ~1.7ms spare CPU time).
     for l in 0..cfg.nlayers {
-        layer::forward_into(cfg, kernels, &weights.layers[l], &ws.x_buf, &mut ws.caches[l], &mut ws.x_next_buf);
+        if l > 0 {
+            let (prev_caches, curr_caches) = ws.caches.split_at_mut(l);
+            layer::forward_into_pipelined(cfg, kernels, &weights.layers[l], &ws.x_buf, &mut curr_caches[0], &mut ws.x_next_buf, Some(&mut prev_caches[l - 1]));
+        } else {
+            layer::forward_into_pipelined(cfg, kernels, &weights.layers[0], &ws.x_buf, &mut ws.caches[0], &mut ws.x_next_buf, None);
+        }
         std::mem::swap(&mut ws.x_buf, &mut ws.x_next_buf);
     }
+    // Read last layer's deferred h1/h3/gate
+    layer::read_ffn_cache(cfg, kernels, &mut ws.caches[cfg.nlayers - 1]);
 
     // 3. x_buf now holds the last layer's output = x_prenorm
     ws.x_prenorm.copy_from_slice(&ws.x_buf);
