@@ -482,20 +482,19 @@ ${INJECT_CONTENT}"
     WATCHDOG_PID=$!
 
     # Run Claude headless — streams to terminal AND log file
-    # Background claude, capture PID, then wait. Tee via process substitution.
+    # Uses exec in a subshell so BASHPID written to pidfile IS the claude process
     log "Launching claude -p --model ${MODEL} ..."
     echo "--- Iteration $i output ---" | tee -a "$LOGFILE"
     set +e
-    claude -p \
-        --dangerously-skip-permissions \
-        --model "$MODEL" \
-        --effort high \
-        "$ITER_PROMPT" > >(tee -a "$LOGFILE") 2>&1 &
-    CLAUDE_ACTUAL_PID=$!
-    echo "$CLAUDE_ACTUAL_PID" > "$CLAUDE_PIDFILE"
-    log "Claude PID=$CLAUDE_ACTUAL_PID"
-    wait "$CLAUDE_ACTUAL_PID"
-    CLAUDE_EXIT=$?
+    (
+        echo $BASHPID > "$CLAUDE_PIDFILE"
+        exec claude -p \
+            --dangerously-skip-permissions \
+            --model "$MODEL" \
+            --effort high \
+            "$ITER_PROMPT"
+    ) 2>&1 | tee -a "$LOGFILE"
+    CLAUDE_EXIT=${PIPESTATUS[0]}
     set -e
     rm -f "$CLAUDE_PIDFILE"
     echo "" | tee -a "$LOGFILE"
