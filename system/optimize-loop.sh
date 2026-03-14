@@ -34,7 +34,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET_MS=89
 MAX_ITERS=20
 COOLDOWN=10
-MODEL="claude-sonnet-4-6"
+MODEL="claude-opus-4-6"
 AGENT_ID="alpha"
 BASE_BRANCH="auto-max"
 DRY_RUN=false
@@ -151,8 +151,12 @@ cleanup_on_exit() {
         sleep 1
         kill -9 "$CLAUDE_CHILD_PID" 2>/dev/null || true
     fi
-    # Targeted fallback — only kill the agent, not interactive sessions
-    pkill -f "Your agent ID is: ${AGENT_ID}" 2>/dev/null || true
+    # Targeted fallback — kill by PID file, not pattern match
+    CLAUDE_PIDFILE="/tmp/rustane-claude-${AGENT_ID}.pid"
+    if [ -f "$CLAUDE_PIDFILE" ]; then
+        kill "$(cat "$CLAUDE_PIDFILE")" 2>/dev/null || true
+        rm -f "$CLAUDE_PIDFILE"
+    fi
 }
 
 on_signal() {
@@ -437,52 +441,50 @@ ${INJECT_CONTENT}"
     gossip_write "ITERATION $i starting"
 
     # --- Per-iteration watchdog timer ---
-    # Kills the claude process if it exceeds the timeout.
+    # Uses a PID file so the watchdog kills the EXACT claude process, not a pattern match.
     # Smart: if cargo/rustc is actively running at timeout, extends by 5min once.
+    CLAUDE_PIDFILE="/tmp/rustane-claude-${AGENT_ID}.pid"
     (
         sleep "$ITER_TIMEOUT_SEC"
 
+        if [ ! -f "$CLAUDE_PIDFILE" ]; then exit 0; fi
+        CPID=$(cat "$CLAUDE_PIDFILE")
+        if ! kill -0 "$CPID" 2>/dev/null; then exit 0; fi
+
         # Check if cargo or rustc is actively running (compiling or testing)
-        EXTENDED=false
         if pgrep -f "cargo|rustc" > /dev/null 2>&1; then
             echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] WATCHDOG: timeout reached but cargo/rustc still running — extending 5min" | tee -a "$LOGFILE"
             echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] WATCHDOG: extended timeout 5min (cargo still running)" >> "$GOSSIP_FILE"
-            EXTENDED=true
-            sleep 300  # 5 extra minutes for tests to finish
+            sleep 300
         fi
 
-        # Now kill for real
-        PIDS=$(pgrep -f "Your agent ID is: ${AGENT_ID}" 2>/dev/null || true)
-        if [ -n "$PIDS" ]; then
-            if $EXTENDED; then
-                echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] TIMEOUT: iteration $i killed after ${ITER_TIMEOUT_MIN}min + 5min extension" | tee -a "$LOGFILE"
-            else
-                echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] TIMEOUT: iteration $i exceeded ${ITER_TIMEOUT_MIN}min — killing claude" | tee -a "$LOGFILE"
-            fi
+        # Kill by exact PID
+        if kill -0 "$CPID" 2>/dev/null; then
+            echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] TIMEOUT: iteration $i — killing claude PID=$CPID" | tee -a "$LOGFILE"
             echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] TIMEOUT: iteration $i killed" >> "$GOSSIP_FILE"
-            # Kill the agent claude process (and its children will die with it)
-            for pid in $PIDS; do
-                kill "$pid" 2>/dev/null
-            done
+            kill "$CPID" 2>/dev/null
             sleep 3
-            for pid in $PIDS; do
-                kill -9 "$pid" 2>/dev/null || true
-            done
+            kill -9 "$CPID" 2>/dev/null || true
         fi
     ) &
     WATCHDOG_PID=$!
 
     # Run Claude headless — streams to terminal AND log file
+    # Uses exec in a subshell so BASHPID written to pidfile IS the claude process
     log "Launching claude -p --model ${MODEL} ..."
     echo "--- Iteration $i output ---" | tee -a "$LOGFILE"
     set +e
-    claude -p \
-        --dangerously-skip-permissions \
-        --model "$MODEL" \
-        --effort high \
-        "$ITER_PROMPT" 2>&1 | tee -a "$LOGFILE"
+    (
+        echo $BASHPID > "$CLAUDE_PIDFILE"
+        exec claude -p \
+            --dangerously-skip-permissions \
+            --model "$MODEL" \
+            --effort high \
+            "$ITER_PROMPT"
+    ) 2>&1 | tee -a "$LOGFILE"
     CLAUDE_EXIT=${PIPESTATUS[0]}
     set -e
+    rm -f "$CLAUDE_PIDFILE"
     echo "" | tee -a "$LOGFILE"
     echo "--- end iteration $i (exit=$CLAUDE_EXIT) ---" | tee -a "$LOGFILE"
 
