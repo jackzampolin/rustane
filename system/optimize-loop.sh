@@ -358,7 +358,7 @@ STEP 8 — UPDATE STATE:
   If the experiment was significant (>5% improvement), update dev/CURRENT.md "What's Next" section.
 
 RULES:
-  - NEVER push to master, main, or auto-max. Only push to YOUR branch (git push origin HEAD).
+  - NEVER push to master or main. Only push to YOUR branch (git push origin HEAD).
   - NEVER change test assertions to make tests pass
   - NEVER skip the correctness check (all tests in STEP 4)
   - NEVER change more than one variable per iteration
@@ -541,19 +541,31 @@ ${INJECT_CONTENT}"
         cp "${WORKTREE}/system/experiments.tsv" "${REPO_ROOT}/dev/experiments.tsv" 2>/dev/null || true
     fi
 
-    # Auto-push branch after each iteration (preserves work, enables remote monitoring)
-    # SAFETY: only ever push the agent's own branch — never auto-max, master, or main
+    # --- Push strategy ---
+    # Alpha branch: always push (backup)
+    # Auto-max: only advance when we have an IMPROVED result
     cd "$WORKTREE"
     CURRENT_BRANCH=$(git branch --show-current 2>/dev/null)
+
+    # Safety: verify we're on the right branch
     if [[ "$CURRENT_BRANCH" != "$BRANCH" ]]; then
         log "SAFETY: expected branch ${BRANCH} but on ${CURRENT_BRANCH} — skipping push"
-        gossip_write "SAFETY: branch mismatch, skipping push (expected=${BRANCH}, actual=${CURRENT_BRANCH})"
-    elif [[ "$CURRENT_BRANCH" == "master" ]] || [[ "$CURRENT_BRANCH" == "main" ]] || [[ "$CURRENT_BRANCH" == "auto-max" ]]; then
+        gossip_write "SAFETY: branch mismatch, skipping push"
+    elif [[ "$CURRENT_BRANCH" == "master" ]] || [[ "$CURRENT_BRANCH" == "main" ]]; then
         log "SAFETY: refusing to push to protected branch ${CURRENT_BRANCH}"
-    elif git diff --quiet HEAD "origin/${BRANCH}" 2>/dev/null; then
-        log "No new commits to push"
     else
+        # Always push alpha (backup)
         git push origin "$BRANCH" 2>/dev/null && log "Pushed to origin/${BRANCH}" || log "Push failed (non-fatal)"
+
+        # Check if this iteration produced an IMPROVED result
+        LAST_VERDICT=$(tail -1 system/experiments.tsv 2>/dev/null | awk -F'\t' '{print $6}')
+        if [[ "$LAST_VERDICT" == "IMPROVED" ]]; then
+            log "IMPROVED result — advancing auto-max to match ${BRANCH}"
+            git push origin "${BRANCH}:${BASE_BRANCH}" 2>/dev/null \
+                && log "Pushed ${BRANCH} → origin/${BASE_BRANCH}" \
+                || log "Failed to advance ${BASE_BRANCH} (non-fatal)"
+            gossip_write "PROMOTED: advanced ${BASE_BRANCH} with latest win"
+        fi
     fi
 
     # Check current ms/step
