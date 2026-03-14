@@ -1419,8 +1419,8 @@ pub fn backward(
         stage_spatial(buf, hidden, w13t_sp, &ws.w3t, dim, 2 * seq + dim);
     }
 
-    // ── 5. ASYNC: ANE ffnBwdW13t || CPU dW1+dW3 accumulation ──
-    // dW2 moved to step 9 overlap (sdpaBwd1 has ANE headroom)
+    // ── 5. ASYNC: ANE ffnBwdW13t || CPU dW3 accumulation ──
+    // dW2 moved to step 9 (sdpaBwd1 overlap), dW1 moved to step 10 (sdpaBwd2 overlap)
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
             kernels.ffn_bwd_w13t.run(
@@ -1428,7 +1428,6 @@ pub fn backward(
                 &[&kernels.bufs.ffn_bwd_w13t_out],
             ).expect("ANE eval failed");
         });
-        accumulate_dw(&cache.x2norm, dim, &ws.dh1, hidden, seq, &mut grads.dw1);
         accumulate_dw(&cache.x2norm, dim, &ws.dh3, hidden, seq, &mut grads.dw3);
         ane_handle.join().expect("ANE thread panicked");
     });
@@ -1518,6 +1517,7 @@ pub fn backward(
         pack_channels(buf, bwd2_in_ch, seq, &cache.q_rope, q_dim, 2 * score_ch);
         pack_channels(buf, bwd2_in_ch, seq, &cache.k_rope, q_dim, 2 * score_ch + q_dim);
     }
+    // ASYNC: ANE sdpaBwd2 || pre-compute wqt+wkt+wvt + dW1 (moved from step 5 to rebalance)
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
             kernels.sdpa_bwd2.run(&[&kernels.bufs.sdpa_bwd2_in], &[&kernels.bufs.sdpa_bwd2_out]).expect("ANE eval failed");
@@ -1525,6 +1525,7 @@ pub fn backward(
         vdsp::mtrans(&weights.wq, q_dim, &mut ws.wqt, dim, dim, q_dim);
         vdsp::mtrans(&weights.wk, kv_dim, &mut ws.wkt, dim, dim, kv_dim);
         vdsp::mtrans(&weights.wv, kv_dim, &mut ws.wvt, dim, dim, kv_dim);
+        accumulate_dw(&cache.x2norm, dim, &ws.dh1, hidden, seq, &mut grads.dw1);
         ane_handle.join().expect("ANE thread panicked");
     });
     {
@@ -1679,8 +1680,8 @@ pub fn backward_into(
         }
     }
 
-    // 5. ASYNC: ANE ffnBwdW13t || CPU dW1+dW3 + pre-compute wot for step 7
-    // dW2 moved to step 9 overlap (sdpaBwd1 has ~0.6ms ANE headroom)
+    // 5. ASYNC: ANE ffnBwdW13t || CPU dW3 + pre-compute wot for step 7
+    // dW2 moved to step 9 (sdpaBwd1 overlap), dW1 moved to step 10 (sdpaBwd2 overlap)
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
             kernels.ffn_bwd_w13t.run(
@@ -1688,7 +1689,6 @@ pub fn backward_into(
                 &[&kernels.bufs.ffn_bwd_w13t_out],
             ).expect("ANE eval failed");
         });
-        accumulate_dw(&cache.x2norm, dim, &ws.dh1, hidden, seq, &mut grads.dw1);
         accumulate_dw(&cache.x2norm, dim, &ws.dh3, hidden, seq, &mut grads.dw3);
         vdsp::mtrans(&weights.wo, dim, &mut ws.wot, q_dim, q_dim, dim);
         ane_handle.join().expect("ANE thread panicked");
@@ -1774,7 +1774,9 @@ pub fn backward_into(
         pack_channels(buf, bwd2_in_ch, seq, &cache.q_rope, q_dim, 2 * score_ch);
         pack_channels(buf, bwd2_in_ch, seq, &cache.k_rope, q_dim, 2 * score_ch + q_dim);
     }
-    // ASYNC: ANE sdpaBwd2 || pre-compute wqt+wkt+wvt for steps 12-14
+    // ASYNC: ANE sdpaBwd2 || pre-compute wqt+wkt+wvt + dW1 (moved from step 5 to rebalance)
+    // Step 5 was CPU-bound (~1.44ms for dW1+dW3+wot vs ANE ~0.5ms). Moving dW1 here
+    // reduces step 5 CPU to ~0.91ms. sdpaBwd2 ANE time absorbs the extra dW1 sgemm.
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
             kernels.sdpa_bwd2.run(&[&kernels.bufs.sdpa_bwd2_in], &[&kernels.bufs.sdpa_bwd2_out]).expect("ANE eval failed");
@@ -1782,6 +1784,7 @@ pub fn backward_into(
         vdsp::mtrans(&weights.wq, q_dim, &mut ws.wqt, dim, dim, q_dim);
         vdsp::mtrans(&weights.wk, kv_dim, &mut ws.wkt, dim, dim, kv_dim);
         vdsp::mtrans(&weights.wv, kv_dim, &mut ws.wvt, dim, dim, kv_dim);
+        accumulate_dw(&cache.x2norm, dim, &ws.dh1, hidden, seq, &mut grads.dw1);
         ane_handle.join().expect("ANE thread panicked");
     });
     {
