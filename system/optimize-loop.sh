@@ -482,21 +482,37 @@ ${INJECT_CONTENT}"
     WATCHDOG_PID=$!
 
     # Run Claude headless — streams to terminal AND log file
-    # Uses exec in a subshell so BASHPID written to pidfile IS the claude process
+    # Uses a FIFO so we can capture claude's exact PID for the watchdog.
     log "Launching claude -p --model ${MODEL} ..."
     echo "--- Iteration $i output ---" | tee -a "$LOGFILE"
+
+    ITER_FIFO="/tmp/rustane-fifo-${AGENT_ID}"
+    rm -f "$ITER_FIFO"
+    mkfifo "$ITER_FIFO"
+
+    # tee reads from FIFO (background)
+    tee -a "$LOGFILE" < "$ITER_FIFO" &
+    TEE_PID=$!
+
+    # claude writes to FIFO (background) — THIS is the PID we track
     set +e
-    (
-        echo $BASHPID > "$CLAUDE_PIDFILE"
-        exec claude -p \
-            --dangerously-skip-permissions \
-            --model "$MODEL" \
-            --effort high \
-            "$ITER_PROMPT"
-    ) 2>&1 | tee -a "$LOGFILE"
-    CLAUDE_EXIT=${PIPESTATUS[0]}
+    claude -p \
+        --dangerously-skip-permissions \
+        --model "$MODEL" \
+        --effort high \
+        "$ITER_PROMPT" > "$ITER_FIFO" 2>&1 &
+    CLAUDE_ACTUAL_PID=$!
+    echo "$CLAUDE_ACTUAL_PID" > "$CLAUDE_PIDFILE"
+    log "Claude PID=$CLAUDE_ACTUAL_PID"
+
+    # Wait for claude to finish (or be killed by watchdog)
+    wait "$CLAUDE_ACTUAL_PID"
+    CLAUDE_EXIT=$?
+
+    # Clean up: close FIFO → tee gets EOF → tee exits
+    wait "$TEE_PID" 2>/dev/null || true
+    rm -f "$ITER_FIFO" "$CLAUDE_PIDFILE"
     set -e
-    rm -f "$CLAUDE_PIDFILE"
     echo "" | tee -a "$LOGFILE"
     echo "--- end iteration $i (exit=$CLAUDE_EXIT) ---" | tee -a "$LOGFILE"
 
