@@ -346,9 +346,11 @@ STEP 7 — COMMIT OR REVERT:
     - git commit with a descriptive message: "Phase 5: <what changed> — <old>ms → <new>ms (<X>% faster)"
     - The test file is ALWAYS committed (even if the optimization is marginal) —
       it permanently protects the invariant for future iterations.
+    - git push origin HEAD (push immediately so work is preserved remotely)
   If REVERTED/BROKEN/NO EFFECT:
     - git checkout -- . (revert code changes AND the test file)
     - git add system/experiments.tsv && git commit -m "Log experiment: <name> (REVERTED/NO EFFECT/etc)"
+    - git push origin HEAD
     - Exception: if the test revealed a pre-existing bug (not caused by your change),
       KEEP the test file, fix the bug, and log as a separate experiment.
 
@@ -501,6 +503,14 @@ ${INJECT_CONTENT}"
     # Sync experiments.tsv back to dev/ (keep local copy in sync)
     if [ -f "${WORKTREE}/system/experiments.tsv" ]; then
         cp "${WORKTREE}/system/experiments.tsv" "${REPO_ROOT}/dev/experiments.tsv" 2>/dev/null || true
+    fi
+
+    # Auto-push branch after each iteration (preserves work, enables remote monitoring)
+    cd "$WORKTREE"
+    if git diff --quiet HEAD "origin/${BRANCH}" 2>/dev/null; then
+        log "No new commits to push"
+    else
+        git push origin "$BRANCH" 2>/dev/null && log "Pushed to origin/${BRANCH}" || log "Push failed (non-fatal)"
     fi
 
     # Check current ms/step
