@@ -6,18 +6,25 @@
 # Each Claude invocation is stateless — reads context from files.
 #
 # Usage:
-#   ./system/optimize-loop.sh                        # 20 iters, sonnet
-#   ./system/optimize-loop.sh --iters 1              # single iteration
-#   ./system/optimize-loop.sh --dry-run              # print prompt, don't run
-#   ./system/optimize-loop.sh --model opus --iters 3 # 3 iters with opus
-#   ./system/optimize-loop.sh --id beta              # second agent (gossip-aware)
+#   ./system/optimize-loop.sh                          # 20 iters, sonnet, 20min timeout
+#   ./system/optimize-loop.sh --iters 1                # single iteration
+#   ./system/optimize-loop.sh --timeout 30             # 30 min per iteration
+#   ./system/optimize-loop.sh --dry-run                # print prompt, don't run
+#   ./system/optimize-loop.sh --model opus --iters 3   # 3 iters with opus
+#   ./system/optimize-loop.sh --id beta                # second agent (gossip-aware)
+#   ./system/optimize-loop.sh --status                 # show current status and exit
 #
-# In tmux:
-#   tmux new -s opt-alpha './system/optimize-loop.sh --id alpha'
-#   tmux new -s opt-beta  './system/optimize-loop.sh --id beta'
+# tmux (recommended):
+#   tmux new -s rustane './system/optimize-loop.sh --iters 50'
 #
-# Stop:  Ctrl-C | touch /tmp/rustane-opt-STOP | tmux kill-session -t opt-alpha
-# Logs:  tail -f /tmp/rustane-opt-alpha.log
+#   Detach:  Ctrl-B then D (leaves it running)
+#   Reattach: tmux attach -t rustane
+#   Kill:    ./system/stop-loop.sh --now   (from any terminal)
+#   Status:  ./system/optimize-loop.sh --status
+#
+# Monitor (in another pane or terminal):
+#   watch -n5 'tail -20 /tmp/rustane-gossip.md'
+#   tail -f /tmp/rustane-opt-alpha.log
 
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -29,18 +36,24 @@ COOLDOWN=10
 MODEL="claude-sonnet-4-6"
 AGENT_ID="alpha"
 DRY_RUN=false
+SHOW_STATUS=false
+ITER_TIMEOUT_MIN=20   # minutes per iteration
 WORKTREE_BASE="/tmp/rustane-opt"
 GOSSIP_FILE="/tmp/rustane-gossip.md"
+PAUSEFILE="/tmp/rustane-opt-PAUSE"
+INJECTFILE="/tmp/rustane-opt-INJECT"
 
 # --- Parse Args ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --dry-run)  DRY_RUN=true; shift ;;
-        --model)    MODEL="$2"; shift 2 ;;
-        --iters)    MAX_ITERS="$2"; shift 2 ;;
-        --target)   TARGET_MS="$2"; shift 2 ;;
-        --id)       AGENT_ID="$2"; shift 2 ;;
-        *)          echo "Unknown arg: $1"; exit 1 ;;
+        --dry-run)   DRY_RUN=true; shift ;;
+        --status)    SHOW_STATUS=true; shift ;;
+        --model)     MODEL="$2"; shift 2 ;;
+        --iters)     MAX_ITERS="$2"; shift 2 ;;
+        --target)    TARGET_MS="$2"; shift 2 ;;
+        --timeout)   ITER_TIMEOUT_MIN="$2"; shift 2 ;;
+        --id)        AGENT_ID="$2"; shift 2 ;;
+        *)           echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
 
@@ -48,10 +61,49 @@ BRANCH="phase5/auto-opt-${AGENT_ID}"
 WORKTREE="${WORKTREE_BASE}-${AGENT_ID}"
 LOGFILE="/tmp/rustane-opt-${AGENT_ID}.log"
 STOPFILE="/tmp/rustane-opt-STOP"
+ITER_TIMEOUT_SEC=$((ITER_TIMEOUT_MIN * 60))
+
+# --- Status Mode ---
+if $SHOW_STATUS; then
+    echo "=== Rustane Optimization Loop Status ==="
+    echo ""
+    # Check if loop is running
+    if pgrep -f "optimize-loop.sh" > /dev/null 2>&1; then
+        echo "Loop: RUNNING"
+        LOOP_PID=$(pgrep -f "optimize-loop.sh --iters" 2>/dev/null | head -1)
+        [ -n "$LOOP_PID" ] && echo "  PID: $LOOP_PID"
+    else
+        echo "Loop: NOT RUNNING"
+    fi
+    if pgrep -f "claude.*dangerously-skip-permissions" > /dev/null 2>&1; then
+        echo "Claude: RUNNING"
+    else
+        echo "Claude: idle"
+    fi
+    echo ""
+    echo "--- Recent Gossip ---"
+    tail -15 "$GOSSIP_FILE" 2>/dev/null || echo "(no gossip file)"
+    echo ""
+    echo "--- Latest Experiments ---"
+    tail -5 "${WORKTREE}/system/experiments.tsv" 2>/dev/null || \
+        tail -5 "${REPO_ROOT}/system/experiments.tsv" 2>/dev/null || \
+        echo "(no experiments file)"
+    echo ""
+    echo "--- Worktree ---"
+    if [ -d "$WORKTREE" ]; then
+        echo "Path: $WORKTREE"
+        echo "Branch: $(git -C "$WORKTREE" branch --show-current 2>/dev/null || echo 'unknown')"
+        echo "Last commit: $(git -C "$WORKTREE" log --oneline -1 2>/dev/null || echo 'none')"
+    else
+        echo "No worktree at $WORKTREE"
+    fi
+    exit 0
+fi
 
 # --- Functions ---
 log() {
-    echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] $*" | tee -a "$LOGFILE"
+    local msg="[$(date '+%H:%M:%S')] [${AGENT_ID}] $*"
+    echo "$msg" | tee -a "$LOGFILE"
 }
 
 get_latest_ms() {
@@ -79,16 +131,38 @@ cleanup_worktree() {
 }
 
 # --- Signal Handling ---
-INTERRUPTED=false
+# Track the claude child PID so we can kill it on Ctrl-C
+CLAUDE_CHILD_PID=""
+WATCHDOG_PID=""
+
+cleanup_on_exit() {
+    # Kill watchdog if running
+    if [ -n "$WATCHDOG_PID" ]; then
+        kill "$WATCHDOG_PID" 2>/dev/null
+        wait "$WATCHDOG_PID" 2>/dev/null || true
+    fi
+    # Kill claude if running
+    if [ -n "$CLAUDE_CHILD_PID" ] && kill -0 "$CLAUDE_CHILD_PID" 2>/dev/null; then
+        log "Killing claude process (PID=$CLAUDE_CHILD_PID)..."
+        kill "$CLAUDE_CHILD_PID" 2>/dev/null
+        sleep 1
+        kill -9 "$CLAUDE_CHILD_PID" 2>/dev/null || true
+    fi
+    # Also pkill by name as fallback
+    pkill -f "claude.*dangerously-skip-permissions" 2>/dev/null || true
+}
+
 on_signal() {
-    INTERRUPTED=true
-    log "Signal received — finishing current iteration then exiting."
+    log "Signal received — killing iteration and exiting."
+    gossip_write "INTERRUPTED — received signal, shutting down"
+    cleanup_on_exit
+    exit 130
 }
 trap on_signal SIGINT SIGTERM
 
 # --- Setup Worktree ---
 log "=== optimize-loop.sh starting ==="
-log "Model: ${MODEL} | Target: ${TARGET_MS}ms | Max: ${MAX_ITERS} iters | Agent: ${AGENT_ID}"
+log "Model: ${MODEL} | Target: ${TARGET_MS}ms | Max: ${MAX_ITERS} iters | Timeout: ${ITER_TIMEOUT_MIN}min | Agent: ${AGENT_ID}"
 
 # Fetch latest from origin so we branch from up-to-date master
 log "Fetching origin..."
@@ -158,6 +232,9 @@ Your agent ID is: %%AGENT_ID%%
 Goal: reduce ms/step to sub-89ms. Maderix Obj-C achieves 89ms.
 Current state: ~125ms/step single-step (with accum=10: ~960ms/step estimated).
 ANY reduction in ms/step is valuable and worth committing — even 2-3ms wins compound.
+
+TIME LIMIT: You have %%TIMEOUT%%min for this iteration. Focus on ONE experiment.
+If implementation is taking too long, simplify or log as PLANNED and exit.
 
 STEP 1 — READ CONTEXT (do this first, do not skip):
   - dev/CURRENT.md (current project state, what works, what's broken)
@@ -294,12 +371,14 @@ RULES:
     Build on them, don't duplicate them.
 PROMPT_END
 
-# Inject agent ID into prompt
+# Inject agent ID and timeout into prompt
 PROMPT="${PROMPT//%%AGENT_ID%%/$AGENT_ID}"
+PROMPT="${PROMPT//%%TIMEOUT%%/$ITER_TIMEOUT_MIN}"
 
 # --- Main Loop ---
 for i in $(seq 1 "$MAX_ITERS"); do
-    log "--- Iteration $i / $MAX_ITERS ---"
+    ITER_START=$(date +%s)
+    log "--- Iteration $i / $MAX_ITERS (timeout: ${ITER_TIMEOUT_MIN}min) ---"
 
     if $DRY_RUN; then
         echo ""
@@ -311,40 +390,108 @@ for i in $(seq 1 "$MAX_ITERS"); do
         echo "Branch:   ${BRANCH}"
         echo "Gossip:   ${GOSSIP_FILE}"
         echo "Log:      ${LOGFILE}"
+        echo "Timeout:  ${ITER_TIMEOUT_MIN} min"
         echo "dev/ context: $(ls "${WORKTREE}/dev/" 2>/dev/null | tr '\n' ' ' || echo 'MISSING')"
         cleanup_worktree
         exit 0
     fi
 
     # Check stop conditions
-    if $INTERRUPTED; then
-        log "Exiting due to interrupt."
-        break
-    fi
     if [[ -f "$STOPFILE" ]]; then
         log "STOP file found (${STOPFILE}). Exiting."
         rm -f "$STOPFILE"
         break
     fi
 
+    # Check pause — wait until pause file is removed
+    if [[ -f "$PAUSEFILE" ]]; then
+        log "PAUSED — waiting for pause file to be removed (./system/intercept.sh resume)"
+        gossip_write "PAUSED — waiting for resume"
+        while [[ -f "$PAUSEFILE" ]]; do
+            sleep 5
+            # Also check for stop while paused
+            if [[ -f "$STOPFILE" ]]; then
+                log "STOP while paused. Exiting."
+                rm -f "$STOPFILE" "$PAUSEFILE"
+                break 2
+            fi
+        done
+        log "RESUMED — continuing iteration $i"
+        gossip_write "RESUMED"
+    fi
+
+    # Check inject — append extra instructions to prompt for this iteration only
+    ITER_PROMPT="$PROMPT"
+    if [[ -f "$INJECTFILE" ]]; then
+        INJECT_CONTENT=$(cat "$INJECTFILE")
+        rm -f "$INJECTFILE"
+        log "INJECT: appending extra instructions to this iteration's prompt"
+        ITER_PROMPT="${PROMPT}
+
+ADDITIONAL INSTRUCTIONS FOR THIS ITERATION (from human operator):
+${INJECT_CONTENT}"
+        gossip_write "INJECTED: ${INJECT_CONTENT:0:80}"
+    fi
+
     gossip_write "ITERATION $i starting"
 
-    # Run Claude headless — stream output to terminal AND log file
+    # --- Per-iteration watchdog timer ---
+    # Kills the claude process if it exceeds the timeout
+    (
+        sleep "$ITER_TIMEOUT_SEC"
+        # Find claude processes with our prompt signature
+        PIDS=$(pgrep -f "Your agent ID is: ${AGENT_ID}" 2>/dev/null || true)
+        if [ -n "$PIDS" ]; then
+            echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] TIMEOUT: iteration $i exceeded ${ITER_TIMEOUT_MIN}min — killing claude" | tee -a "$LOGFILE"
+            echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] TIMEOUT: iteration $i killed after ${ITER_TIMEOUT_MIN}min" >> "$GOSSIP_FILE"
+            for pid in $PIDS; do
+                kill "$pid" 2>/dev/null
+            done
+            sleep 2
+            for pid in $PIDS; do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+        fi
+    ) &
+    WATCHDOG_PID=$!
+
+    # Run Claude headless — streams to terminal AND log file
     log "Launching claude -p --model ${MODEL} ..."
-    echo "--- Iteration $i output ---" >> "$LOGFILE"
+    echo "--- Iteration $i output ---" | tee -a "$LOGFILE"
     set +e
     claude -p \
         --dangerously-skip-permissions \
         --model "$MODEL" \
-        "$PROMPT" 2>&1 | tee -a "$LOGFILE"
+        --effort max \
+        "$ITER_PROMPT" 2>&1 | tee -a "$LOGFILE"
     CLAUDE_EXIT=${PIPESTATUS[0]}
     set -e
-    echo "--- end (exit=$CLAUDE_EXIT) ---" >> "$LOGFILE"
+    echo "" | tee -a "$LOGFILE"
+    echo "--- end iteration $i (exit=$CLAUDE_EXIT) ---" | tee -a "$LOGFILE"
+
+    # Cancel the watchdog
+    kill "$WATCHDOG_PID" 2>/dev/null || true
+    wait "$WATCHDOG_PID" 2>/dev/null || true
+    WATCHDOG_PID=""
+
+    # Report timing
+    ITER_END=$(date +%s)
+    ITER_DURATION=$(( ITER_END - ITER_START ))
+    ITER_MIN=$(( ITER_DURATION / 60 ))
+    ITER_SEC=$(( ITER_DURATION % 60 ))
+    log "Iteration $i took ${ITER_MIN}m${ITER_SEC}s (exit=$CLAUDE_EXIT)"
 
     if [ $CLAUDE_EXIT -ne 0 ]; then
-        log "Claude exited with code $CLAUDE_EXIT. Pausing 30s."
-        gossip_write "ERROR: claude exited with code $CLAUDE_EXIT"
-        sleep 30
+        if [ $CLAUDE_EXIT -eq 137 ] || [ $CLAUDE_EXIT -eq 143 ]; then
+            log "Claude was killed (timeout or signal). Reverting any partial changes."
+            cd "$WORKTREE"
+            git checkout -- . 2>/dev/null || true
+            gossip_write "TIMEOUT: iteration $i killed, changes reverted"
+        else
+            log "Claude exited with code $CLAUDE_EXIT. Pausing 30s."
+            gossip_write "ERROR: claude exited with code $CLAUDE_EXIT"
+        fi
+        sleep 10
         continue
     fi
 
