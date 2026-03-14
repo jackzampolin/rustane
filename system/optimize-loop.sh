@@ -358,6 +358,7 @@ STEP 8 — UPDATE STATE:
   If the experiment was significant (>5% improvement), update dev/CURRENT.md "What's Next" section.
 
 RULES:
+  - NEVER push to master, main, or auto-max. Only push to YOUR branch (git push origin HEAD).
   - NEVER change test assertions to make tests pass
   - NEVER skip the correctness check (all tests in STEP 4)
   - NEVER change more than one variable per iteration
@@ -441,14 +442,33 @@ ${INJECT_CONTENT}"
     gossip_write "ITERATION $i starting"
 
     # --- Per-iteration watchdog timer ---
-    # Kills the claude process if it exceeds the timeout
+    # Kills the claude process if it exceeds the timeout.
+    # Smart: if cargo/rustc is actively running at timeout, extends by 5min once.
     (
         sleep "$ITER_TIMEOUT_SEC"
-        # Find claude processes with our prompt signature
+
+        # Check if cargo or rustc is actively running (compiling or testing)
+        EXTENDED=false
+        if pgrep -f "cargo|rustc" > /dev/null 2>&1; then
+            echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] WATCHDOG: timeout reached but cargo/rustc still running — extending 5min" | tee -a "$LOGFILE"
+            echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] WATCHDOG: extended timeout 5min (cargo still running)" >> "$GOSSIP_FILE"
+            EXTENDED=true
+            sleep 300  # 5 extra minutes for tests to finish
+        fi
+
+        # Now kill for real
         PIDS=$(pgrep -f "Your agent ID is: ${AGENT_ID}" 2>/dev/null || true)
         if [ -n "$PIDS" ]; then
-            echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] TIMEOUT: iteration $i exceeded ${ITER_TIMEOUT_MIN}min — killing claude" | tee -a "$LOGFILE"
-            echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] TIMEOUT: iteration $i killed after ${ITER_TIMEOUT_MIN}min" >> "$GOSSIP_FILE"
+            if $EXTENDED; then
+                echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] TIMEOUT: iteration $i killed after ${ITER_TIMEOUT_MIN}min + 5min extension" | tee -a "$LOGFILE"
+            else
+                echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] TIMEOUT: iteration $i exceeded ${ITER_TIMEOUT_MIN}min — killing claude" | tee -a "$LOGFILE"
+            fi
+            echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] TIMEOUT: iteration $i killed" >> "$GOSSIP_FILE"
+            # Kill cargo/rustc first (child of claude), then claude
+            pkill -f "cargo.*engine" 2>/dev/null || true
+            pkill -f "rustc" 2>/dev/null || true
+            sleep 1
             for pid in $PIDS; do
                 kill "$pid" 2>/dev/null
             done
@@ -487,14 +507,30 @@ ${INJECT_CONTENT}"
     log "Iteration $i took ${ITER_MIN}m${ITER_SEC}s (exit=$CLAUDE_EXIT)"
 
     if [ $CLAUDE_EXIT -ne 0 ]; then
+        cd "$WORKTREE"
         if [ $CLAUDE_EXIT -eq 137 ] || [ $CLAUDE_EXIT -eq 143 ]; then
-            log "Claude was killed (timeout or signal). Reverting any partial changes."
-            cd "$WORKTREE"
+            log "Claude was killed (timeout or signal)."
+            # Check what state the worktree is in
+            DIRTY_FILES=$(git diff --name-only 2>/dev/null || true)
+            STAGED_FILES=$(git diff --cached --name-only 2>/dev/null || true)
+            if [ -n "$DIRTY_FILES" ] || [ -n "$STAGED_FILES" ]; then
+                log "Partial changes found — reverting:"
+                [ -n "$DIRTY_FILES" ] && log "  Modified: $DIRTY_FILES"
+                [ -n "$STAGED_FILES" ] && log "  Staged: $STAGED_FILES"
+                # Log the timeout as a gossip insight so next iteration knows
+                gossip_write "TIMEOUT: iteration $i killed. Had partial changes in: ${DIRTY_FILES} ${STAGED_FILES}. Reverted. Next iteration may want to retry this approach if it looked promising."
+            else
+                gossip_write "TIMEOUT: iteration $i killed (no code changes found — was probably still reading/thinking)"
+            fi
+            # Clean revert
             git checkout -- . 2>/dev/null || true
-            gossip_write "TIMEOUT: iteration $i killed, changes reverted"
+            git clean -fd 2>/dev/null || true
         else
-            log "Claude exited with code $CLAUDE_EXIT. Pausing 30s."
-            gossip_write "ERROR: claude exited with code $CLAUDE_EXIT"
+            log "Claude exited with code $CLAUDE_EXIT."
+            gossip_write "ERROR: iteration $i — claude exited with code $CLAUDE_EXIT"
+            # Still revert any partial changes on non-zero exit
+            git checkout -- . 2>/dev/null || true
+            git clean -fd 2>/dev/null || true
         fi
         sleep 10
         continue
@@ -506,8 +542,15 @@ ${INJECT_CONTENT}"
     fi
 
     # Auto-push branch after each iteration (preserves work, enables remote monitoring)
+    # SAFETY: only ever push the agent's own branch — never auto-max, master, or main
     cd "$WORKTREE"
-    if git diff --quiet HEAD "origin/${BRANCH}" 2>/dev/null; then
+    CURRENT_BRANCH=$(git branch --show-current 2>/dev/null)
+    if [[ "$CURRENT_BRANCH" != "$BRANCH" ]]; then
+        log "SAFETY: expected branch ${BRANCH} but on ${CURRENT_BRANCH} — skipping push"
+        gossip_write "SAFETY: branch mismatch, skipping push (expected=${BRANCH}, actual=${CURRENT_BRANCH})"
+    elif [[ "$CURRENT_BRANCH" == "master" ]] || [[ "$CURRENT_BRANCH" == "main" ]] || [[ "$CURRENT_BRANCH" == "auto-max" ]]; then
+        log "SAFETY: refusing to push to protected branch ${CURRENT_BRANCH}"
+    elif git diff --quiet HEAD "origin/${BRANCH}" 2>/dev/null; then
         log "No new commits to push"
     else
         git push origin "$BRANCH" 2>/dev/null && log "Pushed to origin/${BRANCH}" || log "Push failed (non-fatal)"
