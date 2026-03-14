@@ -46,8 +46,15 @@ case "$ACTION" in
 
     kill|now)
         echo "Killing optimization loop immediately..."
-        # Kill only the AGENT's claude process (matches on agent ID in prompt), not interactive sessions
-        pkill -f "Your agent ID is:" 2>/dev/null && echo "  Killed agent claude process" || echo "  No agent claude process found"
+        # Kill only the AGENT's claude process by PID file, not interactive sessions
+        PIDFILE="/tmp/rustane-claude-alpha.pid"
+        if [ -f "$PIDFILE" ]; then
+            CPID=$(cat "$PIDFILE")
+            kill "$CPID" 2>/dev/null && echo "  Killed agent claude (PID=$CPID)" || echo "  Agent PID $CPID not running"
+            rm -f "$PIDFILE"
+        else
+            echo "  No agent PID file found"
+        fi
         pkill -f "optimize-loop.sh" 2>/dev/null && echo "  Killed loop script" || echo "  No loop script found"
         touch "$STOPFILE"
         rm -f "$PAUSEFILE"
