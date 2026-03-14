@@ -151,8 +151,8 @@ cleanup_on_exit() {
         sleep 1
         kill -9 "$CLAUDE_CHILD_PID" 2>/dev/null || true
     fi
-    # Also pkill by name as fallback
-    pkill -f "claude.*dangerously-skip-permissions" 2>/dev/null || true
+    # Targeted fallback — only kill the agent, not interactive sessions
+    pkill -f "Your agent ID is: ${AGENT_ID}" 2>/dev/null || true
 }
 
 on_signal() {
@@ -178,19 +178,14 @@ if [ -d "$WORKTREE" ]; then
     git worktree remove --force "$WORKTREE" 2>/dev/null || rm -rf "$WORKTREE"
 fi
 
-# Create or rebase branch onto latest origin/${BASE_BRANCH}
-if ! git -C "$REPO_ROOT" show-ref --quiet "refs/heads/${BRANCH}"; then
-    git -C "$REPO_ROOT" branch "$BRANCH" origin/${BASE_BRANCH}
-    log "Created branch ${BRANCH} from origin/${BASE_BRANCH}"
+# Create or reset branch to latest origin/${BASE_BRANCH}
+# NOTE: no checkout required — avoids switching the user's working branch
+if git -C "$REPO_ROOT" show-ref --quiet "refs/heads/${BRANCH}"; then
+    log "Resetting branch ${BRANCH} to origin/${BASE_BRANCH}"
+    git -C "$REPO_ROOT" branch -f "$BRANCH" "origin/${BASE_BRANCH}"
 else
-    log "Rebasing existing branch ${BRANCH} onto origin/${BASE_BRANCH}"
-    git -C "$REPO_ROOT" checkout "$BRANCH" --quiet
-    git -C "$REPO_ROOT" rebase origin/${BASE_BRANCH} --quiet || {
-        log "WARNING: rebase failed, resetting to origin/${BASE_BRANCH}"
-        git -C "$REPO_ROOT" rebase --abort 2>/dev/null || true
-        git -C "$REPO_ROOT" reset --hard origin/${BASE_BRANCH} --quiet
-    }
-    git -C "$REPO_ROOT" checkout - --quiet 2>/dev/null || true
+    git -C "$REPO_ROOT" branch "$BRANCH" "origin/${BASE_BRANCH}"
+    log "Created branch ${BRANCH} from origin/${BASE_BRANCH}"
 fi
 
 # Create the worktree
@@ -465,14 +460,11 @@ ${INJECT_CONTENT}"
                 echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] TIMEOUT: iteration $i exceeded ${ITER_TIMEOUT_MIN}min — killing claude" | tee -a "$LOGFILE"
             fi
             echo "[$(date '+%H:%M:%S')] [${AGENT_ID}] TIMEOUT: iteration $i killed" >> "$GOSSIP_FILE"
-            # Kill cargo/rustc first (child of claude), then claude
-            pkill -f "cargo.*engine" 2>/dev/null || true
-            pkill -f "rustc" 2>/dev/null || true
-            sleep 1
+            # Kill the agent claude process (and its children will die with it)
             for pid in $PIDS; do
                 kill "$pid" 2>/dev/null
             done
-            sleep 2
+            sleep 3
             for pid in $PIDS; do
                 kill -9 "$pid" 2>/dev/null || true
             done
