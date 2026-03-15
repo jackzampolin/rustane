@@ -511,15 +511,20 @@ pub fn update_weights(
         gamma_final_m: ref mut o_gfm, gamma_final_v: ref mut o_gfv,
     } = *opt;
 
-    // 3-way split: embed+L0-1 (~19M), L2-3 (~13M), L4-5+gamma (~13M)
+    // 3-way split: balanced across nlayers (dynamic, not hardcoded).
+    // Thread 1 also handles embed+gamma_final, so gets slightly fewer layers.
     // Each param: 28 bytes memory traffic (read grad/m/v/param, write m/v/param).
     // 3 threads → ~50% more memory bandwidth than 2 threads.
-    let (wl_01, wl_2345) = w_layers.split_at_mut(2);
-    let (wl_23, wl_45) = wl_2345.split_at_mut(2);
-    let (gl_01, gl_2345) = g_layers.split_at(2);
-    let (gl_23, gl_45) = gl_2345.split_at(2);
-    let (ol_01, ol_2345) = o_layers.split_at_mut(2);
-    let (ol_23, ol_45) = ol_2345.split_at_mut(2);
+    // 6 layers → (2,2,2), 8 layers → (3,3,2), 12 → (4,4,4)
+    let nl = w_layers.len();
+    let g1 = (nl + 2) / 3;
+    let g2 = (nl - g1 + 1) / 2;
+    let (wl_01, wl_2345) = w_layers.split_at_mut(g1);
+    let (wl_23, wl_45) = wl_2345.split_at_mut(g2);
+    let (gl_01, gl_2345) = g_layers.split_at(g1);
+    let (gl_23, gl_45) = gl_2345.split_at(g2);
+    let (ol_01, ol_2345) = o_layers.split_at_mut(g1);
+    let (ol_23, ol_45) = ol_2345.split_at_mut(g2);
 
     std::thread::scope(|s| {
         // Thread 1: embed + gamma_final + layers 0-1 (~19M)
