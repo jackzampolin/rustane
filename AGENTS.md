@@ -53,6 +53,7 @@ These optimizations have been tried and PROVEN to not work on this hardware/mode
 | **Pre-stage small IOSurface ops (<0.5ms)** | Thread::scope overhead (20μs) eats into savings. Only helps for ops >1ms. | 2 |
 | **Parallelize SiLU backward** | Loop at 0.87ms/layer is too short for thread parallelism. Scope overhead dominates. | 2 |
 | **Metal GPU for Adam optimizer** | 56 GPU dispatches = 99.8% driver overhead (0.03ms actual compute). CPU loop is faster. | 1 |
+| **Cross-layer dW pipeline** | dW sgemm already fully hidden by within-layer thread::scope overlaps. mpsc channel overhead + wait_current() serialization + cache thrashing added 5ms. | 1 |
 
 ## What DOES Work
 
