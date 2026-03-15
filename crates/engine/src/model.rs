@@ -33,4 +33,21 @@ impl ModelConfig {
             gqa_ratio: 1,
         }
     }
+
+    /// GPT-1024: NL=8, DIM=1024, HEADS=8, MHA — above ANE sweet spot (>=1024)
+    pub fn gpt_1024() -> Self {
+        Self {
+            dim: 1024,
+            hidden: 2816,       // ~2.75x dim (GPT-2 ratio)
+            heads: 8,
+            kv_heads: 8,
+            hd: 128,            // 1024 / 8
+            seq: 512,
+            nlayers: 8,
+            vocab: 8192,
+            q_dim: 1024,        // MHA: q_dim = dim
+            kv_dim: 1024,       // MHA: kv_dim = dim
+            gqa_ratio: 1,
+        }
+    }
 }
