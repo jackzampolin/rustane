@@ -28,155 +28,239 @@ get_current_ms() {
     echo "${ms:-???}"
 }
 
+# Draw a box: box <row> <col> <width> <height> <title> <title_color>
+box() {
+    local r=$1 c=$2 w=$3 h=$4 title=$5 tcol=${6:-$WHT}
+    # Top border
+    tput cup $r $c
+    printf "${D}+"
+    printf '%*s' $((w - 2)) '' | tr ' ' '-'
+    printf "+${R}"
+    # Title overlay
+    if [ -n "$title" ]; then
+        tput cup $r $((c + 2))
+        printf " ${B}${tcol}%s${R} " "$title"
+    fi
+    # Sides
+    for ((i=1; i<h-1; i++)); do
+        tput cup $((r + i)) $c
+        printf "${D}|${R}"
+        tput cup $((r + i)) $((c + w - 1))
+        printf "${D}|${R}"
+    done
+    # Bottom border
+    tput cup $((r + h - 1)) $c
+    printf "${D}+"
+    printf '%*s' $((w - 2)) '' | tr ' ' '-'
+    printf "+${R}"
+}
+
+# Write text inside a box: btext <row> <col> <text> [color]
+btext() {
+    tput cup $1 $2
+    printf "${3}%s${R}" "$4"
+}
+
+# Clear a line region: bclear <row> <col> <width>
+bclear() {
+    tput cup $1 $2
+    printf "%*s" $3 ""
+}
+
 render() {
     local W=$(tput cols)
     local H=$(tput lines)
-    local line=0
-    local sep=$(printf '%*s' $((W - 4)) '' | tr ' ' '-')
 
-    # Move cursor to top, don't clear (no flicker)
+    # Layout: 2 columns
+    local LW=$(( (W - 3) / 2 ))  # left width
+    local RW=$(( W - LW - 3 ))   # right width
+    local LC=1                     # left col
+    local RC=$((LW + 2))          # right col
+
     tput cup 0 0
 
     # Header
-    printf "${B}${CYN}  RUSTANE OPTIMIZATION DASHBOARD${R}%*s\n" $((W - 33)) ""
-    printf "${D}  %s  |  target: 89ms  |  current: %sms${R}%*s\n" "$(date '+%H:%M:%S')" "$(get_current_ms)" $((W - 50)) ""
-    printf "${D}  %s${R}\n" "$sep"
-    line=3
+    printf "${B}${CYN}  RUSTANE${R} ${D}%s | current: ${GRN}%sms${R} ${D}| target: ${YLW}89ms${R}" "$(date '+%H:%M:%S')" "$(get_current_ms)"
+    printf "%*s\n" $((W - 55)) ""
 
-    # Projects
-    printf "\n${B}${WHT}  PROJECTS${R}%*s\n\n" $((W - 12)) ""
-    line=$((line + 3))
+    # ═══════════════════════════════════════
+    # LEFT COLUMN: Projects + Trajectory
+    # ═══════════════════════════════════════
 
-    local has_projects=false
+    # Projects box
+    local proj_h=3  # base height
+    local proj_count=0
     for f in "$PROJECT_DIR"/*.md; do
         [ -f "$f" ] || continue
-        [ $line -ge $((H - 15)) ] && break  # leave room for other sections
-        has_projects=true
-        local name=$(basename "$f" .md)
-        local status=$(grep "^status:" "$f" 2>/dev/null | head -1 | cut -d' ' -f2-)
-        local branch=$(grep "^branch:" "$f" 2>/dev/null | head -1 | cut -d' ' -f2-)
-
-        local scol="${WHT}"
-        case "$status" in
-            RESEARCH)       scol="${BLU}" ;;
-            PLANNING)       scol="${MAG}" ;;
-            IMPLEMENTING*)  scol="${YLW}" ;;
-            TESTING)        scol="${CYN}" ;;
-            BENCHMARKING)   scol="${CYN}" ;;
-            REVIEW*)        scol="${MAG}" ;;
-            READY*|DONE)    scol="${GRN}" ;;
-            ABANDONED)      scol="${RED}" ;;
-        esac
-
-        # Agent info
-        local pid_file="/tmp/rustane-project-PID-$name"
-        local status_file="/tmp/rustane-project-status-$name"
-        local agent_info="${D}idle${R}"
-        if [ -f "$pid_file" ]; then
-            local pid=$(cat "$pid_file")
-            if kill -0 "$pid" 2>/dev/null; then
-                local elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
-                agent_info="${GRN}PID $pid ${D}($elapsed)${R}"
-            else
-                agent_info="${RED}dead${R}"
-            fi
-        fi
-
-        local phase=$(cat "$status_file" 2>/dev/null | cut -c1-$((W - 40)) || echo "-")
-
-        printf "  ${B}${scol}%-18s${R}  %-14s  %b%*s\n" "$name" "$status" "$agent_info" 10 ""
-        printf "  ${D}%-*s${R}\n" $((W - 4)) "  $branch | $phase"
-        line=$((line + 2))
-
-        # Progress
-        local done total
-        done=$(grep -cE '^\d+\. \[x\]' "$f" 2>/dev/null) || done=0
-        total=$(grep -cE '^\d+\. \[' "$f" 2>/dev/null) || total=0
-        if [ "$total" -gt 0 ] 2>/dev/null; then
-            local bar=""
-            for ((j=0; j<done; j++)); do bar+="#"; done
-            for ((j=done; j<total; j++)); do bar+="."; done
-            printf "  ${D}  [${GRN}%s${D}] %d/%d${R}%*s\n" "$bar" "$done" "$total" $((W - ${#bar} - 14)) ""
-            line=$((line + 1))
-        fi
-
-        [ -f "/tmp/rustane-project-PAUSE-$name" ] && { printf "  ${YLW}  PAUSED${R}%*s\n" $((W - 12)) ""; line=$((line + 1)); }
-        printf "%*s\n" "$W" ""
-        line=$((line + 1))
+        proj_count=$((proj_count + 1))
+        proj_h=$((proj_h + 3))
     done
+    [ $proj_count -eq 0 ] && proj_h=4
 
-    if ! $has_projects; then
-        printf "  ${D}No projects. ./system/project.sh --new <name> --desc <desc>${R}%*s\n\n" 10 ""
-        line=$((line + 2))
-    fi
+    box 2 $LC $LW $proj_h "PROJECTS" "$CYN"
 
-    # Hardware
-    printf "${D}  %s${R}\n" "$sep"
-    printf "${B}${WHT}  HARDWARE${R}%*s\n" $((W - 12)) ""
-    line=$((line + 2))
-
-    if [ -f "$HW_LOCK" ]; then
-        printf "  ${YLW}LOCKED by: %s${R}%*s\n" "$(cat "$HW_LOCK")" $((W - 25)) ""
+    local row=3
+    if [ $proj_count -eq 0 ]; then
+        bclear $row $((LC + 2)) $((LW - 4))
+        btext $row $((LC + 2)) "$D" "no active projects"
     else
-        printf "  ${GRN}ANE/Metal: available${R}%*s\n" $((W - 24)) ""
-    fi
+        for f in "$PROJECT_DIR"/*.md; do
+            [ -f "$f" ] || continue
+            local name=$(basename "$f" .md)
+            local status=$(grep "^status:" "$f" 2>/dev/null | head -1 | cut -d' ' -f2-)
+            local phase=$(cat "/tmp/rustane-project-status-$name" 2>/dev/null | cut -c1-$((LW - 6)) || echo "-")
 
-    local cargo_count=$(pgrep -f "cargo.*engine" 2>/dev/null | wc -l | tr -d ' ')
-    [ "$cargo_count" -gt 0 ] && printf "  ${CYN}cargo: %s active${R}%*s\n" "$cargo_count" $((W - 20)) ""
-    printf "%*s\n" "$W" ""
-    line=$((line + 3))
+            local scol="${WHT}"
+            case "$status" in
+                RESEARCH)       scol="${BLU}" ;;
+                PLANNING)       scol="${MAG}" ;;
+                IMPLEMENTING*)  scol="${YLW}" ;;
+                TESTING|BENCH*) scol="${CYN}" ;;
+                REVIEW*|READY*) scol="${GRN}" ;;
+                DONE)           scol="${GRN}" ;;
+                ABANDONED)      scol="${RED}" ;;
+            esac
 
-    # Performance
-    printf "${D}  %s${R}\n" "$sep"
-    printf "${B}${WHT}  TRAJECTORY${R}  ${D}1260 -> 138 -> 102 -> ${GRN}$(get_current_ms)ms${R}  ${D}(target ${YLW}89${D})${R}%*s\n\n" 10 ""
-    line=$((line + 3))
-
-    # Gossip (fill remaining space)
-    local gossip_lines=$((H - line - 3))
-    [ $gossip_lines -lt 3 ] && gossip_lines=3
-    [ $gossip_lines -gt 10 ] && gossip_lines=10
-
-    printf "${D}  %s${R}\n" "$sep"
-    printf "${B}${WHT}  RECENT ACTIVITY${R}%*s\n" $((W - 19)) ""
-    line=$((line + 2))
-
-    if [ -f "$GOSSIP" ]; then
-        tail -$gossip_lines "$GOSSIP" 2>/dev/null | while IFS= read -r gline; do
-            local truncated="${gline:0:$((W - 4))}"
-            if echo "$gline" | grep -q "IMPROVED"; then
-                printf "  ${GRN}%s${R}%*s\n" "$truncated" $((W - ${#truncated} - 4)) ""
-            elif echo "$gline" | grep -q "TIMEOUT\|ERROR\|WORSE\|REVERTED"; then
-                printf "  ${RED}%s${R}%*s\n" "$truncated" $((W - ${#truncated} - 4)) ""
-            elif echo "$gline" | grep -q "CLAIMED\|ITERATION"; then
-                printf "  ${CYN}%s${R}%*s\n" "$truncated" $((W - ${#truncated} - 4)) ""
-            else
-                printf "  ${D}%s${R}%*s\n" "$truncated" $((W - ${#truncated} - 4)) ""
+            # Agent info
+            local agent_str="${D}idle${R}"
+            local pid_file="/tmp/rustane-project-PID-$name"
+            if [ -f "$pid_file" ]; then
+                local pid=$(cat "$pid_file")
+                if kill -0 "$pid" 2>/dev/null; then
+                    local elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+                    agent_str="${GRN}PID $pid ${D}($elapsed)"
+                else
+                    agent_str="${RED}dead"
+                fi
             fi
+
+            bclear $row $((LC + 2)) $((LW - 4))
+            btext $row $((LC + 2)) "${B}${scol}" "$(printf '%-18s %s' "$name" "$status")"
+
+            row=$((row + 1))
+            bclear $row $((LC + 2)) $((LW - 4))
+            btext $row $((LC + 2)) "" "$(printf '%b  %b' "$agent_str" "${R}")"
+
+            row=$((row + 1))
+            bclear $row $((LC + 2)) $((LW - 4))
+            btext $row $((LC + 2)) "$D" "$(echo "$phase" | cut -c1-$((LW - 6)))"
+
+            row=$((row + 1))
         done
     fi
 
+    # Trajectory box (below projects)
+    local traj_top=$((2 + proj_h + 1))
+    local traj_h=6
+    box $traj_top $LC $LW $traj_h "TRAJECTORY" "$YLW"
+
+    local ms=$(get_current_ms)
+    local target=89
+    local start=1260
+
+    bclear $((traj_top + 1)) $((LC + 2)) $((LW - 4))
+    btext $((traj_top + 1)) $((LC + 2)) "$D" "1260ms -------> 138ms -------> ${GRN}${ms}ms${R}"
+
+    # Progress bar toward target
+    local bar_w=$((LW - 12))
+    local gap=$((start - target))
+    local progress=$((start - ${ms:-102}))
+    local filled=$((progress * bar_w / gap))
+    [ $filled -gt $bar_w ] && filled=$bar_w
+    [ $filled -lt 0 ] && filled=0
+    local empty=$((bar_w - filled))
+
+    local bar=""
+    for ((j=0; j<filled; j++)); do bar+="#"; done
+    for ((j=0; j<empty; j++)); do bar+="."; done
+
+    bclear $((traj_top + 2)) $((LC + 2)) $((LW - 4))
+    btext $((traj_top + 2)) $((LC + 2)) "" "$(printf '  ${GRN}%s${D}%s${R}' "${bar:0:$filled}" "${bar:$filled}")"
+
+    bclear $((traj_top + 3)) $((LC + 2)) $((LW - 4))
+    local pct=$(( progress * 100 / gap ))
+    btext $((traj_top + 3)) $((LC + 2)) "$D" "  ${pct}% of the way to 89ms"
+
+    bclear $((traj_top + 4)) $((LC + 2)) $((LW - 4))
+
+    # ═══════════════════════════════════════
+    # RIGHT COLUMN: Hardware + Activity
+    # ═══════════════════════════════════════
+
+    # Hardware box
+    local hw_h=6
+    box 2 $RC $RW $hw_h "HARDWARE" "$GRN"
+
+    bclear 3 $((RC + 2)) $((RW - 4))
+    if [ -f "$HW_LOCK" ]; then
+        btext 3 $((RC + 2)) "${YLW}" "ANE/Metal: LOCKED ($(cat "$HW_LOCK"))"
+    else
+        btext 3 $((RC + 2)) "${GRN}" "ANE/Metal: available"
+    fi
+
+    bclear 4 $((RC + 2)) $((RW - 4))
+    local cargo_n=$(pgrep -f "cargo.*engine" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$cargo_n" -gt 0 ]; then
+        btext 4 $((RC + 2)) "${CYN}" "cargo: $cargo_n active"
+    else
+        btext 4 $((RC + 2)) "$D" "cargo: idle"
+    fi
+
+    bclear 5 $((RC + 2)) $((RW - 4))
+    local claude_n=$(pgrep -f "claude.*dangerously" 2>/dev/null | grep -v grep | wc -l | tr -d ' ')
+    btext 5 $((RC + 2)) "$D" "claude agents: $claude_n"
+
+    bclear 6 $((RC + 2)) $((RW - 4))
+
+    # Activity box (fills remaining right column)
+    local act_top=$((2 + hw_h + 1))
+    local act_h=$((H - act_top - 2))
+    [ $act_h -lt 5 ] && act_h=5
+
+    box $act_top $RC $RW $act_h "ACTIVITY" "$MAG"
+
+    local act_lines=$((act_h - 2))
+    local act_row=$((act_top + 1))
+
+    if [ -f "$GOSSIP" ]; then
+        tail -$act_lines "$GOSSIP" 2>/dev/null | while IFS= read -r gline; do
+            bclear $act_row $((RC + 2)) $((RW - 4))
+            local trunc="${gline:0:$((RW - 6))}"
+            if echo "$gline" | grep -q "IMPROVED"; then
+                btext $act_row $((RC + 2)) "${GRN}" "$trunc"
+            elif echo "$gline" | grep -q "TIMEOUT\|ERROR\|WORSE\|REVERTED"; then
+                btext $act_row $((RC + 2)) "${RED}" "$trunc"
+            elif echo "$gline" | grep -q "CLAIMED\|ITERATION\|RESEARCHING"; then
+                btext $act_row $((RC + 2)) "${CYN}" "$trunc"
+            else
+                btext $act_row $((RC + 2)) "$D" "$trunc"
+            fi
+            act_row=$((act_row + 1))
+        done
+    fi
+    # Clear remaining activity lines
+    while [ $act_row -lt $((act_top + act_h - 1)) ]; do
+        bclear $act_row $((RC + 2)) $((RW - 4))
+        act_row=$((act_row + 1))
+    done
+
     # Footer
     tput cup $((H - 1)) 0
-    printf "${D}  q: quit  |  ./system/project.sh --status  |  ./system/dashboard.sh --once${R}%*s" $((W - 76)) ""
-
-    # Clear any leftover lines below content
-    tput el
+    printf "${D}  q: quit | ./system/dashboard.sh | ./system/project.sh --status${R}%*s" $((W - 65)) ""
 }
 
 # Main
 if $ONCE; then
+    clear
     render
     echo ""
     exit 0
 fi
 
-# Hide cursor, restore on exit
 tput civis 2>/dev/null
-trap 'tput cnorm 2>/dev/null; tput sgr0; exit 0' EXIT INT TERM
+trap 'tput cnorm 2>/dev/null; tput sgr0; clear; exit 0' EXIT INT TERM
 
-# Initial clear, then overwrite in place
 clear
-
 while true; do
     render
     if read -t "$REFRESH" -rsn 1 key 2>/dev/null; then
