@@ -201,11 +201,20 @@ pub fn forward_ws(
     embedding::forward(&weights.embed, dim, tokens, &mut ws.x_row);
     vdsp::mtrans(&ws.x_row, dim, &mut ws.x_buf, seq, seq, dim);
 
-    // 2. Forward through NL layers (pre-allocated caches, zero allocs)
+    // 2. Forward through NL layers with pipelined ffnFused cache readback.
+    // Each layer defers its h1/h3/gate readback (12MB). The NEXT layer reads them
+    // during its sdpaFwd ANE overlap (step 3, ~1.7ms spare CPU time).
     for l in 0..cfg.nlayers {
-        layer::forward_into(cfg, kernels, &weights.layers[l], &ws.x_buf, &mut ws.caches[l], &mut ws.x_next_buf);
+        if l > 0 {
+            let (prev_caches, curr_caches) = ws.caches.split_at_mut(l);
+            layer::forward_into_pipelined(cfg, kernels, &weights.layers[l], &ws.x_buf, &mut curr_caches[0], &mut ws.x_next_buf, Some(&mut prev_caches[l - 1]));
+        } else {
+            layer::forward_into_pipelined(cfg, kernels, &weights.layers[0], &ws.x_buf, &mut ws.caches[0], &mut ws.x_next_buf, None);
+        }
         std::mem::swap(&mut ws.x_buf, &mut ws.x_next_buf);
     }
+    // Read last layer's deferred h1/h3/gate
+    layer::read_ffn_cache(cfg, kernels, &mut ws.caches[cfg.nlayers - 1]);
 
     // 3. x_buf now holds the last layer's output = x_prenorm
     ws.x_prenorm.copy_from_slice(&ws.x_buf);
@@ -471,8 +480,9 @@ pub fn backward(
 }
 
 /// Apply Adam to all model weights with split learning rates.
-/// Batches all 56 parameter updates into a single Metal GPU command buffer.
-/// `grad_scale` is applied to gradients inline on GPU (fused descale+clip).
+/// Uses 2-thread parallelism: step_fused is compute-bound (sqrt+div per element),
+/// and single-threaded achieves only ~80 GB/s of M4 Max's 400 GB/s bandwidth.
+/// `grad_scale` is applied to gradients inline (fused descale+clip).
 /// Pass 1.0 for no scaling, or the combined descale/clip factor.
 pub fn update_weights(
     cfg: &ModelConfig,
@@ -482,59 +492,115 @@ pub fn update_weights(
     t: u32,
     lr: f32,
     tc: &TrainConfig,
-    metal_adam: &MetalAdam,
+    _metal_adam: &MetalAdam,
     grad_scale: f32,
 ) {
+    use crate::cpu::adam::step_fused;
+
     let wd = tc.weight_decay;
     let matrix_lr = lr * tc.matrix_lr_scale;
     let embed_lr = lr * tc.embed_lr_scale;
-
     let (b1, b2, eps) = (tc.beta1, tc.beta2, tc.eps);
-    // begin_batch pre-creates 6 shared scalar buffers (beta1,beta2,eps,bc1,bc2,grad_scale).
-    // add() only allocates 2 per-tensor scalars (lr, wd) — down from 8 per call.
-    let mut batch = metal_adam.begin_batch(t, b1, b2, eps, grad_scale);
 
-    // Embedding (no weight decay)
-    batch.add(&mut weights.embed, &grads.dembed, &mut opt.embed_m, &mut opt.embed_v, embed_lr, 0.0);
+    // Destructure into independent borrows for safe parallel access.
+    let ModelWeights { embed: ref mut w_embed, layers: ref mut w_layers, gamma_final: ref mut w_gf } = *weights;
+    let ModelGrads { dembed: ref g_embed, layers: ref g_layers, dgamma_final: ref g_gf } = *grads;
+    let ModelOptState {
+        embed_m: ref mut o_em, embed_v: ref mut o_ev,
+        layers: ref mut o_layers,
+        gamma_final_m: ref mut o_gfm, gamma_final_v: ref mut o_gfv,
+    } = *opt;
 
-    // Final RMSNorm (no weight decay)
-    batch.add(&mut weights.gamma_final, &grads.dgamma_final, &mut opt.gamma_final_m, &mut opt.gamma_final_v, lr, 0.0);
+    // 3-way split: embed+L0-1 (~19M), L2-3 (~13M), L4-5+gamma (~13M)
+    // Each param: 28 bytes memory traffic (read grad/m/v/param, write m/v/param).
+    // 3 threads → ~50% more memory bandwidth than 2 threads.
+    let (wl_01, wl_2345) = w_layers.split_at_mut(2);
+    let (wl_23, wl_45) = wl_2345.split_at_mut(2);
+    let (gl_01, gl_2345) = g_layers.split_at(2);
+    let (gl_23, gl_45) = gl_2345.split_at(2);
+    let (ol_01, ol_2345) = o_layers.split_at_mut(2);
+    let (ol_23, ol_45) = ol_2345.split_at_mut(2);
 
-    // Per-layer
-    for l in 0..cfg.nlayers {
-        let w = &mut weights.layers[l];
-        let g = &grads.layers[l];
-        let o = &mut opt.layers[l];
+    std::thread::scope(|s| {
+        // Thread 1: embed + gamma_final + layers 0-1 (~19M)
+        let h1 = s.spawn(move || {
+            step_fused(w_embed, g_embed, o_em, o_ev, t, embed_lr, b1, b2, eps, 0.0, grad_scale);
+            step_fused(w_gf, g_gf, o_gfm, o_gfv, t, lr, b1, b2, eps, 0.0, grad_scale);
+            for l in 0..wl_01.len() {
+                update_layer(&mut wl_01[l], &gl_01[l], &mut ol_01[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
+            }
+        });
 
-        // Weight matrices
-        batch.add(&mut w.wq, &g.dwq, &mut o.m_wq, &mut o.v_wq, matrix_lr, wd);
-        batch.add(&mut w.wk, &g.dwk, &mut o.m_wk, &mut o.v_wk, matrix_lr, wd);
-        batch.add(&mut w.wv, &g.dwv, &mut o.m_wv, &mut o.v_wv, matrix_lr, wd);
-        batch.add(&mut w.wo, &g.dwo, &mut o.m_wo, &mut o.v_wo, matrix_lr, wd);
-        batch.add(&mut w.w1, &g.dw1, &mut o.m_w1, &mut o.v_w1, matrix_lr, wd);
-        batch.add(&mut w.w3, &g.dw3, &mut o.m_w3, &mut o.v_w3, matrix_lr, wd);
-        batch.add(&mut w.w2, &g.dw2, &mut o.m_w2, &mut o.v_w2, matrix_lr, wd);
+        // Thread 2: layers 2-3 (~13M)
+        let h2 = s.spawn(move || {
+            for l in 0..wl_23.len() {
+                update_layer(&mut wl_23[l], &gl_23[l], &mut ol_23[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
+            }
+        });
 
-        // RMSNorm scales (no weight decay)
-        batch.add(&mut w.gamma1, &g.dgamma1, &mut o.m_gamma1, &mut o.v_gamma1, lr, 0.0);
-        batch.add(&mut w.gamma2, &g.dgamma2, &mut o.m_gamma2, &mut o.v_gamma2, lr, 0.0);
-    }
+        // Main thread: layers 4-5 (~13M)
+        for l in 0..wl_45.len() {
+            update_layer(&mut wl_45[l], &gl_45[l], &mut ol_45[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
+        }
 
-    batch.execute();
+        h1.join().expect("Adam thread 1 panicked");
+        h2.join().expect("Adam thread 2 panicked");
+    });
+}
+
+/// Update all weight tensors in a single layer.
+#[inline]
+fn update_layer(
+    w: &mut LayerWeights,
+    g: &LayerGrads,
+    o: &mut LayerOptState,
+    t: u32,
+    matrix_lr: f32,
+    b1: f32, b2: f32, eps: f32, wd: f32,
+    lr: f32,
+    grad_scale: f32,
+) {
+    use crate::cpu::adam::step_fused;
+    step_fused(&mut w.wq, &g.dwq, &mut o.m_wq, &mut o.v_wq, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+    step_fused(&mut w.wk, &g.dwk, &mut o.m_wk, &mut o.v_wk, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+    step_fused(&mut w.wv, &g.dwv, &mut o.m_wv, &mut o.v_wv, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+    step_fused(&mut w.wo, &g.dwo, &mut o.m_wo, &mut o.v_wo, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+    step_fused(&mut w.w1, &g.dw1, &mut o.m_w1, &mut o.v_w1, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+    step_fused(&mut w.w3, &g.dw3, &mut o.m_w3, &mut o.v_w3, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+    step_fused(&mut w.w2, &g.dw2, &mut o.m_w2, &mut o.v_w2, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+    step_fused(&mut w.gamma1, &g.dgamma1, &mut o.m_gamma1, &mut o.v_gamma1, t, lr, b1, b2, eps, 0.0, grad_scale);
+    step_fused(&mut w.gamma2, &g.dgamma2, &mut o.m_gamma2, &mut o.v_gamma2, t, lr, b1, b2, eps, 0.0, grad_scale);
 }
 
 
 /// Global gradient L2 norm (uses vDSP_svesq — single call per tensor, no scratch).
+/// Split across 2 threads: embed+gamma+layers[0..mid] on thread 1, layers[mid..] on main.
 pub fn grad_norm(grads: &ModelGrads) -> f32 {
-    let mut sum = 0.0f32;
-    sum += vdsp::svesq(&grads.dembed);
-    sum += vdsp::svesq(&grads.dgamma_final);
-    for lg in &grads.layers {
-        for g in [&lg.dwq, &lg.dwk, &lg.dwv, &lg.dwo, &lg.dw1, &lg.dw3, &lg.dw2, &lg.dgamma1, &lg.dgamma2] {
-            sum += vdsp::svesq(g);
+    let mid = grads.layers.len() / 2;
+    let (lo, hi) = grads.layers.split_at(mid);
+
+    let (sum1, sum2) = std::thread::scope(|s| {
+        let handle = s.spawn(|| {
+            let mut sum = vdsp::svesq(&grads.dembed);
+            sum += vdsp::svesq(&grads.dgamma_final);
+            for lg in lo {
+                for g in [&lg.dwq, &lg.dwk, &lg.dwv, &lg.dwo, &lg.dw1, &lg.dw3, &lg.dw2, &lg.dgamma1, &lg.dgamma2] {
+                    sum += vdsp::svesq(g);
+                }
+            }
+            sum
+        });
+
+        let mut sum = 0.0f32;
+        for lg in hi {
+            for g in [&lg.dwq, &lg.dwk, &lg.dwv, &lg.dwo, &lg.dw1, &lg.dw3, &lg.dw2, &lg.dgamma1, &lg.dgamma2] {
+                sum += vdsp::svesq(g);
+            }
         }
-    }
-    sum.sqrt()
+        (handle.join().expect("norm thread panicked"), sum)
+    });
+
+    (sum1 + sum2).sqrt()
 }
 
 /// Clip all gradients by global L2 norm (in-place cblas_sscal, no scratch allocs).
