@@ -10,13 +10,22 @@ use engine::model::ModelConfig;
 use std::time::Instant;
 
 #[test]
-#[ignore] // Run manually: cargo test -p engine --test bench_step_time --release -- --ignored --nocapture
+#[ignore]
 fn bench_training_step() {
-    let cfg = ModelConfig::gpt_karpathy();
+    bench_config(ModelConfig::gpt_karpathy(), "gpt_karpathy (6L, 768dim)");
+}
+
+#[test]
+#[ignore]
+fn bench_training_step_1024() {
+    bench_config(ModelConfig::gpt_1024(), "gpt_1024 (8L, 1024dim)");
+}
+
+fn bench_config(cfg: ModelConfig, name: &str) {
 
     println!("\n=== Rustane Training Step Benchmark ===");
-    println!("Model: gpt_karpathy (NL={}, DIM={}, SEQ={}, VOCAB={})",
-             cfg.nlayers, cfg.dim, cfg.seq, cfg.vocab);
+    println!("Model: {} (NL={}, DIM={}, HIDDEN={}, SEQ={}, VOCAB={})",
+             name, cfg.nlayers, cfg.dim, cfg.hidden, cfg.seq, cfg.vocab);
 
     // Compile all 10 ANE kernels
     println!("\nCompiling 10 ANE kernels...");
