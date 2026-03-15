@@ -164,7 +164,8 @@ log "=== Starting project step: $STATUS ==="
 log "Branch: $BRANCH | Model: $MODEL"
 
 # Preflight: verify base branch has all wins
-log "Preflight: checking base branch..."
+BASE_BRANCH="auto-max"  # default base for preflight checks
+log "Preflight: checking base branch ($BASE_BRANCH)..."
 cd "$REPO_ROOT"
 git fetch origin --quiet
 for agent_branch in $(git branch -r 2>/dev/null | grep "phase5/auto-opt" | tr -d ' '); do
