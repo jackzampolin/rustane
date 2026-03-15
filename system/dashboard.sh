@@ -93,7 +93,7 @@ render() {
     for f in "$PROJECT_DIR"/*.md; do
         [ -f "$f" ] || continue
         proj_count=$((proj_count + 1))
-        proj_h=$((proj_h + 3))
+        proj_h=$((proj_h + 4))
     done
     [ $proj_count -eq 0 ] && proj_h=4
 
@@ -135,15 +135,38 @@ render() {
             fi
 
             bclear $row $((LC + 2)) $((LW - 4))
-            btext $row $((LC + 2)) "${B}${scol}" "$(printf '%-18s %s' "$name" "$status")"
+            btext $row $((LC + 2)) "${B}${scol}" "$(printf '%-18s' "$name")"
+            # Agent PID inline
+            tput cup $row $((LC + 22))
+            printf "%b${R}" "$agent_str"
 
+            # Breadcrumb trail: RSRCH > PLAN > IMPL > TEST > BNCH > REVW
             row=$((row + 1))
             bclear $row $((LC + 2)) $((LW - 4))
-            btext $row $((LC + 2)) "" "$(printf '%b  %b' "$agent_str" "${R}")"
+            local steps="RESEARCH PLANNING IMPLEMENTING TESTING BENCHMARKING REVIEW"
+            local found=false
+            local bc="  "
+            for step in $steps; do
+                local label="${step:0:4}"
+                if [ "$found" = "false" ]; then
+                    if [ "$step" = "$status" ] || [[ "$status" == "$step"* ]]; then
+                        bc+="${B}${scol}[${label}]${R} > "
+                        found=true
+                    else
+                        bc+="${GRN}${label}${R} > "
+                    fi
+                else
+                    bc+="${D}${label}${R} > "
+                fi
+            done
+            bc="${bc% > }"  # remove trailing >
+            tput cup $row $((LC + 2))
+            printf "%b" "$bc"
 
+            # Phase detail
             row=$((row + 1))
             bclear $row $((LC + 2)) $((LW - 4))
-            btext $row $((LC + 2)) "$D" "$(echo "$phase" | cut -c1-$((LW - 6)))"
+            btext $row $((LC + 2)) "$D" "  $(echo "$phase" | cut -c1-$((LW - 8)))"
 
             row=$((row + 1))
         done
