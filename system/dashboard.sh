@@ -2,217 +2,184 @@
 # dashboard.sh — Live terminal dashboard for rustane optimization system
 #
 # Usage:
-#   ./system/dashboard.sh          # refreshes every 3s
-#   ./system/dashboard.sh --once   # single render, no loop
-#
-# Looks like mactop/jtop but for your AI optimization pipeline.
+#   ./system/dashboard.sh          # live, refreshes every 3s
+#   ./system/dashboard.sh --once   # single render
 
 REFRESH=3
 ONCE=false
 [[ "${1:-}" == "--once" ]] && ONCE=true
 
-# --- Colors ---
-RST="\033[0m"
-BOLD="\033[1m"
-DIM="\033[2m"
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-BLUE="\033[34m"
-MAGENTA="\033[35m"
-CYAN="\033[36m"
-WHITE="\033[37m"
-BG_DARK="\033[48;5;234m"
-BG_CARD="\033[48;5;236m"
-
 PROJECT_DIR="/tmp/rustane-projects"
 HW_LOCK="/tmp/rustane-hw-lock"
 GOSSIP="/tmp/rustane-gossip.md"
 
+# Colors
+R="\033[0m" B="\033[1m" D="\033[2m"
+RED="\033[31m" GRN="\033[32m" YLW="\033[33m"
+BLU="\033[34m" MAG="\033[35m" CYN="\033[36m" WHT="\033[37m"
+
+get_current_ms() {
+    local ms=""
+    for tsv in /Users/dan/Dev/rustane/system/experiments.tsv /tmp/rustane-worktree-*/system/experiments.tsv /tmp/rustane-opt-*/system/experiments.tsv; do
+        [ -f "$tsv" ] || continue
+        local val=$(tail -20 "$tsv" 2>/dev/null | grep -v '^-' | grep -v 'PLANNED' | awk -F'\t' '$7 ~ /^[0-9]+$/ { ms=$7 } END { print ms }')
+        [ -n "$val" ] && ms="$val"
+    done
+    echo "${ms:-???}"
+}
+
 render() {
-    clear
-    local COLS=$(tput cols)
-    local NOW=$(date '+%H:%M:%S')
+    local W=$(tput cols)
+    local H=$(tput lines)
+    local line=0
+    local sep=$(printf '%*s' $((W - 4)) '' | tr ' ' '-')
 
-    # ── Header ──
-    printf "${BG_DARK}${BOLD}${CYAN}"
-    printf "  %-*s" $((COLS - 2)) "RUSTANE OPTIMIZATION DASHBOARD"
-    printf "${RST}\n"
-    printf "${DIM}  $(date '+%Y-%m-%d %H:%M:%S')  |  target: 89ms  |  current: $(get_current_ms)ms  |  refresh: ${REFRESH}s${RST}\n"
-    printf "${DIM}  ─%.0s" $(seq 1 $((COLS - 4)))
-    printf "${RST}\n"
+    # Move cursor to top, don't clear (no flicker)
+    tput cup 0 0
 
-    # ── Projects ──
-    printf "\n${BOLD}${WHITE}  PROJECTS${RST}\n\n"
+    # Header
+    printf "${B}${CYN}  RUSTANE OPTIMIZATION DASHBOARD${R}%*s\n" $((W - 33)) ""
+    printf "${D}  %s  |  target: 89ms  |  current: %sms${R}%*s\n" "$(date '+%H:%M:%S')" "$(get_current_ms)" $((W - 50)) ""
+    printf "${D}  %s${R}\n" "$sep"
+    line=3
+
+    # Projects
+    printf "\n${B}${WHT}  PROJECTS${R}%*s\n\n" $((W - 12)) ""
+    line=$((line + 3))
 
     local has_projects=false
     for f in "$PROJECT_DIR"/*.md; do
         [ -f "$f" ] || continue
+        [ $line -ge $((H - 15)) ] && break  # leave room for other sections
         has_projects=true
         local name=$(basename "$f" .md)
         local status=$(grep "^status:" "$f" 2>/dev/null | head -1 | cut -d' ' -f2-)
         local branch=$(grep "^branch:" "$f" 2>/dev/null | head -1 | cut -d' ' -f2-)
-        local desc=$(grep "^description:" "$f" 2>/dev/null | head -1 | cut -d' ' -f2-)
 
-        # Status color
-        local scol="${WHITE}"
+        local scol="${WHT}"
         case "$status" in
-            RESEARCH)       scol="${BLUE}" ;;
-            PLANNING)       scol="${MAGENTA}" ;;
-            IMPLEMENTING*)  scol="${YELLOW}" ;;
-            TESTING)        scol="${CYAN}" ;;
-            BENCHMARKING)   scol="${CYAN}" ;;
-            REVIEW)         scol="${MAGENTA}" ;;
-            READY_TO_MERGE) scol="${GREEN}" ;;
-            DONE)           scol="${GREEN}" ;;
+            RESEARCH)       scol="${BLU}" ;;
+            PLANNING)       scol="${MAG}" ;;
+            IMPLEMENTING*)  scol="${YLW}" ;;
+            TESTING)        scol="${CYN}" ;;
+            BENCHMARKING)   scol="${CYN}" ;;
+            REVIEW*)        scol="${MAG}" ;;
+            READY*|DONE)    scol="${GRN}" ;;
             ABANDONED)      scol="${RED}" ;;
         esac
 
         # Agent info
         local pid_file="/tmp/rustane-project-PID-$name"
         local status_file="/tmp/rustane-project-status-$name"
-        local agent_status="idle"
-        local agent_elapsed=""
+        local agent_info="${D}idle${R}"
         if [ -f "$pid_file" ]; then
             local pid=$(cat "$pid_file")
             if kill -0 "$pid" 2>/dev/null; then
-                agent_elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
-                agent_status="running"
+                local elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+                agent_info="${GRN}PID $pid ${D}($elapsed)${R}"
             else
-                agent_status="dead"
+                agent_info="${RED}dead${R}"
             fi
         fi
 
-        local phase=$(cat "$status_file" 2>/dev/null || echo "-")
+        local phase=$(cat "$status_file" 2>/dev/null | cut -c1-$((W - 40)) || echo "-")
 
-        # Render project card
-        printf "  ${BG_CARD}${BOLD}${scol} %-20s ${RST}" "$name"
-        printf "${BG_CARD} ${scol}%-15s${RST}" "$status"
-        if [ "$agent_status" = "running" ]; then
-            printf "${BG_CARD} ${GREEN}● ${WHITE}PID %-6s ${DIM}%s${RST}" "$pid" "$agent_elapsed"
-        elif [ "$agent_status" = "dead" ]; then
-            printf "${BG_CARD} ${RED}✕ dead${RST}              "
-        else
-            printf "${BG_CARD} ${DIM}○ idle${RST}              "
-        fi
-        printf "\n"
-        printf "  ${DIM}  branch: %-30s phase: %s${RST}\n" "$branch" "$phase"
+        printf "  ${B}${scol}%-18s${R}  %-14s  %b%*s\n" "$name" "$status" "$agent_info" 10 ""
+        printf "  ${D}%-*s${R}\n" $((W - 4)) "  $branch | $phase"
+        line=$((line + 2))
 
-        # Steps progress
+        # Progress
         local done total
         done=$(grep -cE '^\d+\. \[x\]' "$f" 2>/dev/null) || done=0
         total=$(grep -cE '^\d+\. \[' "$f" 2>/dev/null) || total=0
         if [ "$total" -gt 0 ] 2>/dev/null; then
-            printf "  ${DIM}  progress: ${GREEN}"
-            for ((j=0; j<done; j++)); do printf '█'; done
-            printf "${DIM}"
-            for ((j=done; j<total; j++)); do printf '░'; done
-            printf " ${WHITE}%d/%d${RST}\n" "$done" "$total"
+            local bar=""
+            for ((j=0; j<done; j++)); do bar+="#"; done
+            for ((j=done; j<total; j++)); do bar+="."; done
+            printf "  ${D}  [${GRN}%s${D}] %d/%d${R}%*s\n" "$bar" "$done" "$total" $((W - ${#bar} - 14)) ""
+            line=$((line + 1))
         fi
 
-        # Pause/inject indicators
-        [ -f "/tmp/rustane-project-PAUSE-$name" ] && printf "  ${YELLOW}  ⏸  PAUSED${RST}\n"
-        [ -f "/tmp/rustane-project-INJECT-$name" ] && printf "  ${BLUE}  💉 INJECT queued${RST}\n"
-
-        printf "\n"
+        [ -f "/tmp/rustane-project-PAUSE-$name" ] && { printf "  ${YLW}  PAUSED${R}%*s\n" $((W - 12)) ""; line=$((line + 1)); }
+        printf "%*s\n" "$W" ""
+        line=$((line + 1))
     done
 
     if ! $has_projects; then
-        printf "  ${DIM}No active projects. Create one with:${RST}\n"
-        printf "  ${DIM}./system/project.sh --new <name> --desc <description>${RST}\n\n"
+        printf "  ${D}No projects. ./system/project.sh --new <name> --desc <desc>${R}%*s\n\n" 10 ""
+        line=$((line + 2))
     fi
 
-    # ── Old Loop (if running) ──
-    local loop_status="/tmp/rustane-status-alpha"
-    if [ -f "$loop_status" ]; then
-        printf "${BOLD}${WHITE}  OPTIMIZATION LOOP${RST}\n\n"
-        local lstatus=$(cat "$loop_status" 2>/dev/null || echo "stopped")
-        if tmux has-session -t rustane 2>/dev/null; then
-            printf "  ${GREEN}● ${WHITE}%-20s ${DIM}%s${RST}\n" "loop: RUNNING" "$lstatus"
-        else
-            printf "  ${DIM}○ loop: STOPPED ${RST}\n"
-        fi
-        printf "\n"
-    fi
+    # Hardware
+    printf "${D}  %s${R}\n" "$sep"
+    printf "${B}${WHT}  HARDWARE${R}%*s\n" $((W - 12)) ""
+    line=$((line + 2))
 
-    # ── Hardware ──
-    printf "${BOLD}${WHITE}  HARDWARE${RST}\n\n"
     if [ -f "$HW_LOCK" ]; then
-        local holder=$(cat "$HW_LOCK" 2>/dev/null || echo "unknown")
-        printf "  ${YELLOW}● ANE/Metal LOCKED by: %s${RST}\n" "$holder"
+        printf "  ${YLW}LOCKED by: %s${R}%*s\n" "$(cat "$HW_LOCK")" $((W - 25)) ""
     else
-        printf "  ${GREEN}● ANE/Metal: available${RST}\n"
+        printf "  ${GRN}ANE/Metal: available${R}%*s\n" $((W - 24)) ""
     fi
 
-    # Check for active cargo/rustc
     local cargo_count=$(pgrep -f "cargo.*engine" 2>/dev/null | wc -l | tr -d ' ')
-    if [ "$cargo_count" -gt 0 ]; then
-        printf "  ${CYAN}● cargo: %s process(es) active${RST}\n" "$cargo_count"
-    fi
-    printf "\n"
+    [ "$cargo_count" -gt 0 ] && printf "  ${CYN}cargo: %s active${R}%*s\n" "$cargo_count" $((W - 20)) ""
+    printf "%*s\n" "$W" ""
+    line=$((line + 3))
 
-    # ── Performance ──
-    printf "${BOLD}${WHITE}  PERFORMANCE TRAJECTORY${RST}\n\n"
-    printf "  ${DIM}1260 ─────────────────────────────── start${RST}\n"
-    printf "  ${DIM} 138 ──────── async+staging wins${RST}\n"
-    printf "  ${GREEN} 102 ──── opus wins (current auto-max)${RST}\n"
-    printf "  ${YELLOW}  89 ···· target (maderix Obj-C)${RST}\n"
-    printf "\n"
+    # Performance
+    printf "${D}  %s${R}\n" "$sep"
+    printf "${B}${WHT}  TRAJECTORY${R}  ${D}1260 -> 138 -> 102 -> ${GRN}$(get_current_ms)ms${R}  ${D}(target ${YLW}89${D})${R}%*s\n\n" 10 ""
+    line=$((line + 3))
 
-    # ── Recent Gossip ──
-    printf "${BOLD}${WHITE}  RECENT ACTIVITY${RST}\n\n"
+    # Gossip (fill remaining space)
+    local gossip_lines=$((H - line - 3))
+    [ $gossip_lines -lt 3 ] && gossip_lines=3
+    [ $gossip_lines -gt 10 ] && gossip_lines=10
+
+    printf "${D}  %s${R}\n" "$sep"
+    printf "${B}${WHT}  RECENT ACTIVITY${R}%*s\n" $((W - 19)) ""
+    line=$((line + 2))
+
     if [ -f "$GOSSIP" ]; then
-        tail -6 "$GOSSIP" 2>/dev/null | while IFS= read -r line; do
-            if echo "$line" | grep -q "IMPROVED"; then
-                printf "  ${GREEN}%s${RST}\n" "$line"
-            elif echo "$line" | grep -q "TIMEOUT\|ERROR\|WORSE"; then
-                printf "  ${RED}%s${RST}\n" "$line"
-            elif echo "$line" | grep -q "CLAIMED\|ITERATION"; then
-                printf "  ${CYAN}%s${RST}\n" "$line"
+        tail -$gossip_lines "$GOSSIP" 2>/dev/null | while IFS= read -r gline; do
+            local truncated="${gline:0:$((W - 4))}"
+            if echo "$gline" | grep -q "IMPROVED"; then
+                printf "  ${GRN}%s${R}%*s\n" "$truncated" $((W - ${#truncated} - 4)) ""
+            elif echo "$gline" | grep -q "TIMEOUT\|ERROR\|WORSE\|REVERTED"; then
+                printf "  ${RED}%s${R}%*s\n" "$truncated" $((W - ${#truncated} - 4)) ""
+            elif echo "$gline" | grep -q "CLAIMED\|ITERATION"; then
+                printf "  ${CYN}%s${R}%*s\n" "$truncated" $((W - ${#truncated} - 4)) ""
             else
-                printf "  ${DIM}%s${RST}\n" "$line"
+                printf "  ${D}%s${R}%*s\n" "$truncated" $((W - ${#truncated} - 4)) ""
             fi
         done
-    else
-        printf "  ${DIM}(no gossip)${RST}\n"
     fi
-    printf "\n"
 
-    # ── Controls ──
-    printf "${DIM}  ─%.0s" $(seq 1 $((COLS - 4)))
-    printf "${RST}\n"
-    printf "${DIM}  q: quit  |  project --status  |  intercept.sh pause/inject/kill${RST}\n"
+    # Footer
+    tput cup $((H - 1)) 0
+    printf "${D}  q: quit  |  ./system/project.sh --status  |  ./system/dashboard.sh --once${R}%*s" $((W - 76)) ""
+
+    # Clear any leftover lines below content
+    tput el
 }
 
-get_current_ms() {
-    # Find the latest ms/step from any experiments.tsv
-    local ms=""
-    for tsv in /tmp/rustane-worktree-*/system/experiments.tsv /tmp/rustane-opt-*/system/experiments.tsv /Users/dan/Dev/rustane/system/experiments.tsv; do
-        [ -f "$tsv" ] || continue
-        local val=$(tail -20 "$tsv" 2>/dev/null | grep -v '^-' | grep -v 'PLANNED' | awk -F'\t' '$7 ~ /^[0-9]+$/ { ms=$7 } END { print ms }')
-        if [ -n "$val" ]; then
-            ms="$val"
-        fi
-    done
-    echo "${ms:-???}"
-}
-
-# ── Main ──
+# Main
 if $ONCE; then
     render
+    echo ""
     exit 0
 fi
 
-# Interactive loop with quit on 'q'
-stty -echo 2>/dev/null || true
-trap 'stty echo 2>/dev/null; exit 0' EXIT INT TERM
+# Hide cursor, restore on exit
+tput civis 2>/dev/null
+trap 'tput cnorm 2>/dev/null; tput sgr0; exit 0' EXIT INT TERM
+
+# Initial clear, then overwrite in place
+clear
 
 while true; do
     render
-    # Non-blocking read with timeout
-    if read -t "$REFRESH" -n 1 key 2>/dev/null; then
-        case "$key" in
-            q|Q) break ;;
-        esac
+    if read -t "$REFRESH" -rsn 1 key 2>/dev/null; then
+        [[ "$key" == "q" || "$key" == "Q" ]] && break
     fi
 done
