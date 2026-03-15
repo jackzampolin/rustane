@@ -63,8 +63,8 @@ if $SHOW_STATUS; then
     cat "$STATUS_FILE" 2>/dev/null || echo "Not running"
     echo ""
     if [ -f "$PID_FILE" ]; then
-        local pid=$(cat "$PID_FILE")
-        ps -p "$pid" -o pid,etime,pcpu 2>/dev/null || echo "PID $pid dead"
+        BENCH_PID=$(cat "$PID_FILE")
+        ps -p "$BENCH_PID" -o pid,etime,pcpu 2>/dev/null || echo "PID $BENCH_PID dead"
     fi
     echo ""
     echo "--- Recent Log ---"
@@ -114,7 +114,7 @@ log "HEAD: $(git log --oneline -1)"
 echo "WAITING: hardware lock" > "$STATUS_FILE"
 log "Acquiring hardware lock..."
 while [ -f "$HW_LOCK" ]; do
-    local holder=$(cat "$HW_LOCK" 2>/dev/null || echo "unknown")
+    HOLDER=$(cat "$HW_LOCK" 2>/dev/null || echo "unknown")
     log "HW lock held by $holder — waiting..."
     sleep 10
 done
@@ -149,9 +149,39 @@ echo "TESTING: phase4 training" > "$STATUS_FILE"
 cargo test -p engine --test phase4_training --release 2>&1 | tail -3 >> "$LOG_FILE"
 log "PASS: phase4_training"
 
-# --- Phase 2: Benchmark (3x) ---
+# --- Phase 2a: Baseline benchmark (on auto-max) ---
+echo "BASELINE: benchmarking auto-max" > "$STATUS_FILE"
+log "Phase 2a: Running baseline benchmark on $BASELINE..."
+
+BASELINE_WORKTREE="/tmp/rustane-bench-baseline"
+if [ -d "$BASELINE_WORKTREE" ]; then
+    git -C "$REPO_ROOT" worktree remove --force "$BASELINE_WORKTREE" 2>/dev/null || rm -rf "$BASELINE_WORKTREE"
+fi
+git -C "$REPO_ROOT" worktree add "$BASELINE_WORKTREE" "origin/$BASELINE" 2>/dev/null
+
+if [ -d "${REPO_ROOT}/dev" ]; then
+    mkdir -p "${BASELINE_WORKTREE}/dev"
+    for f in CURRENT.md METHODOLOGY.md; do
+        [ -f "${REPO_ROOT}/dev/$f" ] && cp "${REPO_ROOT}/dev/$f" "${BASELINE_WORKTREE}/dev/$f"
+    done
+fi
+
+cd "$BASELINE_WORKTREE"
+BASELINE_OUT=$(cargo test -p engine --test bench_step_time --release -- --ignored --nocapture 2>&1)
+BASELINE_MS=$(echo "$BASELINE_OUT" | grep -E "^[2-4]" | awk '{sum+=$2; n++} END {printf "%.0f", sum/n}')
+BASELINE_FWD=$(echo "$BASELINE_OUT" | grep -E "^[2-4]" | awk '{sum+=$3; n++} END {printf "%.0f", sum/n}')
+BASELINE_BWD=$(echo "$BASELINE_OUT" | grep -E "^[2-4]" | awk '{sum+=$4; n++} END {printf "%.0f", sum/n}')
+log "BASELINE ($BASELINE): ${BASELINE_MS}ms/step (fwd: ${BASELINE_FWD}ms, bwd: ${BASELINE_BWD}ms)"
+
+cd "$REPO_ROOT"
+git worktree remove --force "$BASELINE_WORKTREE" 2>/dev/null || true
+
+# Back to feature worktree
+cd "$WORKTREE"
+
+# --- Phase 2b: Feature benchmark (3x) ---
 echo "BENCHMARKING: run 1/$BENCH_RUNS" > "$STATUS_FILE"
-log "Phase 2: Running benchmarks ($BENCH_RUNS runs)..."
+log "Phase 2b: Running feature benchmarks ($BENCH_RUNS runs)..."
 
 BENCH_RESULTS=""
 for run in $(seq 1 $BENCH_RUNS); do
@@ -215,17 +245,18 @@ echo "DONE: ${AVG_MS}ms/step (all tests pass)" > "$STATUS_FILE"
 REPORT="[$(date '+%H:%M:%S')] [bench] RESULT: $BRANCH_SHORT — ${AVG_MS}ms/step"
 REPORT="$REPORT | tests: ALL PASS | bench: $BENCH_RESULTS(avg $AVG_MS)"
 
-# Find baseline ms for comparison
-BASELINE_MS=$(tail -20 system/experiments.tsv 2>/dev/null | grep -v '^-' | grep -v PLANNED | awk -F'\t' '$7 ~ /^[0-9]+$/ {ms=$7} END{print ms}')
+# Compare against MEASURED baseline (not experiments.tsv)
 if [ -n "$BASELINE_MS" ]; then
     DELTA=$((BASELINE_MS - AVG_MS))
     if [ $DELTA -gt 0 ]; then
-        REPORT="$REPORT | vs baseline: -${DELTA}ms FASTER"
+        REPORT="$REPORT | vs ${BASELINE} (measured ${BASELINE_MS}ms): -${DELTA}ms FASTER"
     elif [ $DELTA -lt 0 ]; then
-        REPORT="$REPORT | vs baseline: +$((-DELTA))ms SLOWER"
+        REPORT="$REPORT | vs ${BASELINE} (measured ${BASELINE_MS}ms): +$((-DELTA))ms SLOWER"
     else
-        REPORT="$REPORT | vs baseline: NO CHANGE"
+        REPORT="$REPORT | vs ${BASELINE} (measured ${BASELINE_MS}ms): NO CHANGE"
     fi
+else
+    REPORT="$REPORT | baseline bench failed"
 fi
 
 log "$REPORT"

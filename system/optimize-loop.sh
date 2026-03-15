@@ -582,11 +582,29 @@ ${INJECT_CONTENT}"
         # Check if this iteration produced an IMPROVED result
         LAST_VERDICT=$(tail -1 system/experiments.tsv 2>/dev/null | awk -F'\t' '{print $6}')
         if [[ "$LAST_VERDICT" == "IMPROVED" ]]; then
-            log "IMPROVED result — advancing auto-max to match ${BRANCH}"
-            git push origin "${BRANCH}:${BASE_BRANCH}" 2>/dev/null \
-                && log "Pushed ${BRANCH} → origin/${BASE_BRANCH}" \
-                || log "Failed to advance ${BASE_BRANCH} (non-fatal)"
-            gossip_write "PROMOTED: advanced ${BASE_BRANCH} with latest win"
+            log "IMPROVED result — advancing ${BASE_BRANCH} to match ${BRANCH}"
+            if git push origin "${BRANCH}:${BASE_BRANCH}" 2>/dev/null; then
+                log "Pushed ${BRANCH} → origin/${BASE_BRANCH}"
+                gossip_write "PROMOTED: advanced ${BASE_BRANCH} with latest win"
+            else
+                # Retry: fetch, merge, push
+                log "WARNING: promotion failed (non-fast-forward). Retrying with merge..."
+                gossip_write "WARNING: promotion failed, retrying with merge"
+                git fetch origin "$BASE_BRANCH" --quiet
+                git merge "origin/$BASE_BRANCH" --no-edit 2>/dev/null || {
+                    log "CRITICAL: merge conflict during promotion. Wins NOT on ${BASE_BRANCH}!"
+                    gossip_write "CRITICAL: promotion merge conflict — wins stuck on ${BRANCH}. Manual merge needed."
+                    echo "PROMOTION_FAILED" > "/tmp/rustane-promotion-failed-${AGENT_ID}"
+                }
+                if git push origin "${BRANCH}:${BASE_BRANCH}" 2>/dev/null; then
+                    log "Promotion succeeded after merge retry"
+                    gossip_write "PROMOTED: ${BASE_BRANCH} advanced (after merge retry)"
+                else
+                    log "CRITICAL: promotion failed even after merge. Wins NOT on ${BASE_BRANCH}!"
+                    gossip_write "CRITICAL: wins on ${BRANCH} NOT promoted. Manual merge needed."
+                    echo "PROMOTION_FAILED" > "/tmp/rustane-promotion-failed-${AGENT_ID}"
+                fi
+            fi
         fi
     fi
 

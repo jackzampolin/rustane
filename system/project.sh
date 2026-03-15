@@ -163,6 +163,28 @@ DESC=$(grep "^description:" "$PROJECT_FILE" | head -1 | cut -d' ' -f2-)
 log "=== Starting project step: $STATUS ==="
 log "Branch: $BRANCH | Model: $MODEL"
 
+# Preflight: verify base branch has all wins
+log "Preflight: checking base branch..."
+cd "$REPO_ROOT"
+git fetch origin --quiet
+for agent_branch in $(git branch -r 2>/dev/null | grep "phase5/auto-opt" | tr -d ' '); do
+    AHEAD=$(git log --oneline "origin/${BASE_BRANCH}..${agent_branch}" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$AHEAD" -gt 0 ]; then
+        log "WARNING: $agent_branch is $AHEAD commits ahead of ${BASE_BRANCH}"
+        log "Merging $agent_branch into ${BASE_BRANCH}..."
+        git checkout "$BASE_BRANCH" --quiet
+        git merge "$agent_branch" --no-edit 2>/dev/null && {
+            git push origin "$BASE_BRANCH" --quiet
+            log "Merged and pushed"
+        } || {
+            log "CRITICAL: merge conflict. Resolve manually before proceeding."
+            git merge --abort 2>/dev/null || true
+        }
+        git checkout - --quiet 2>/dev/null || true
+    fi
+done
+log "Preflight: base branch verified"
+
 # Check pause
 if [ -f "$PAUSE_FILE" ]; then
     log "PAUSED — remove $PAUSE_FILE to resume"
