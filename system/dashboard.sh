@@ -222,22 +222,30 @@ render() {
     local act_lines=$((act_h - 2))
     local act_row=$((act_top + 1))
 
+    # Read gossip into array (avoids subshell pipe problem)
+    local -a glines=()
     if [ -f "$GOSSIP" ]; then
-        tail -$act_lines "$GOSSIP" 2>/dev/null | while IFS= read -r gline; do
-            bclear $act_row $((RC + 2)) $((RW - 4))
-            local trunc="${gline:0:$((RW - 6))}"
-            if echo "$gline" | grep -q "IMPROVED"; then
-                btext $act_row $((RC + 2)) "${GRN}" "$trunc"
-            elif echo "$gline" | grep -q "TIMEOUT\|ERROR\|WORSE\|REVERTED"; then
-                btext $act_row $((RC + 2)) "${RED}" "$trunc"
-            elif echo "$gline" | grep -q "CLAIMED\|ITERATION\|RESEARCHING"; then
-                btext $act_row $((RC + 2)) "${CYN}" "$trunc"
-            else
-                btext $act_row $((RC + 2)) "$D" "$trunc"
-            fi
-            act_row=$((act_row + 1))
-        done
+        while IFS= read -r gline; do
+            glines+=("$gline")
+        done < <(tail -$act_lines "$GOSSIP" 2>/dev/null)
     fi
+
+    for gline in "${glines[@]}"; do
+        [ $act_row -ge $((act_top + act_h - 1)) ] && break
+        bclear $act_row $((RC + 2)) $((RW - 4))
+        local trunc="${gline:0:$((RW - 6))}"
+        if echo "$gline" | grep -q "IMPROVED"; then
+            btext $act_row $((RC + 2)) "${GRN}" "$trunc"
+        elif echo "$gline" | grep -q "TIMEOUT\|ERROR\|WORSE\|REVERTED"; then
+            btext $act_row $((RC + 2)) "${RED}" "$trunc"
+        elif echo "$gline" | grep -q "CLAIMED\|ITERATION\|RESEARCHING"; then
+            btext $act_row $((RC + 2)) "${CYN}" "$trunc"
+        else
+            btext $act_row $((RC + 2)) "$D" "$trunc"
+        fi
+        act_row=$((act_row + 1))
+    done
+
     # Clear remaining activity lines
     while [ $act_row -lt $((act_top + act_h - 1)) ]; do
         bclear $act_row $((RC + 2)) $((RW - 4))
