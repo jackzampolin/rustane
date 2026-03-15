@@ -55,10 +55,10 @@ box() {
     printf "+${R}"
 }
 
-# Write text inside a box: btext <row> <col> <text> [color]
+# Write text inside a box: btext <row> <col> <color> <text>
 btext() {
     tput cup $1 $2
-    printf "${3}%s${R}" "$4"
+    printf "%b%s%b" "$3" "$4" "$R"
 }
 
 # Clear a line region: bclear <row> <col> <width>
@@ -92,6 +92,13 @@ render() {
     local proj_count=0
     for f in "$PROJECT_DIR"/*.md; do
         [ -f "$f" ] || continue
+        # Skip finished projects
+        local _pst=$(grep "^status:" "$f" 2>/dev/null | head -1 | cut -d' ' -f2-)
+        [[ "$_pst" == "ABANDONED" || "$_pst" == "DONE" ]] && continue
+        # Skip projects with dead agents and no progress (abandoned in practice)
+        local _pid_f="/tmp/rustane-project-PID-$(basename "$f" .md)"
+        local _stat_f="/tmp/rustane-project-status-$(basename "$f" .md)"
+        if [ -f "$_stat_f" ] && grep -qi "abandon\|recommend ABANDON" "$_stat_f" 2>/dev/null; then continue; fi
         proj_count=$((proj_count + 1))
         proj_h=$((proj_h + 4))
     done
@@ -108,6 +115,9 @@ render() {
             [ -f "$f" ] || continue
             local name=$(basename "$f" .md)
             local status=$(grep "^status:" "$f" 2>/dev/null | head -1 | cut -d' ' -f2-)
+            [[ "$status" == "ABANDONED" || "$status" == "DONE" ]] && continue
+            local _sf="/tmp/rustane-project-status-$name"
+            if [ -f "$_sf" ] && grep -qi "abandon" "$_sf" 2>/dev/null; then continue; fi
             local phase=$(cat "/tmp/rustane-project-status-$name" 2>/dev/null | cut -c1-$((LW - 6)) || echo "-")
 
             local scol="${WHT}"
@@ -182,27 +192,31 @@ render() {
     local start=1260
 
     bclear $((traj_top + 1)) $((LC + 2)) $((LW - 4))
-    btext $((traj_top + 1)) $((LC + 2)) "$D" "1260ms -------> 138ms -------> ${GRN}${ms}ms${R}"
+    tput cup $((traj_top + 1)) $((LC + 2))
+    printf "%b1260 > 138 > %b%sms%b > %b89ms%b" "$D" "$B$GRN" "$ms" "$R" "$YLW" "$R"
 
     # Progress bar toward target
-    local bar_w=$((LW - 12))
+    local bar_w=$((LW - 16))
     local gap=$((start - target))
-    local progress=$((start - ${ms:-102}))
+    local ms_num=${ms:-102}
+    local progress=$((start - ms_num))
     local filled=$((progress * bar_w / gap))
     [ $filled -gt $bar_w ] && filled=$bar_w
     [ $filled -lt 0 ] && filled=0
-    local empty=$((bar_w - filled))
 
-    local bar=""
-    for ((j=0; j<filled; j++)); do bar+="#"; done
-    for ((j=0; j<empty; j++)); do bar+="."; done
+    local bar_full="" bar_empty=""
+    for ((j=0; j<filled; j++)); do bar_full+="#"; done
+    for ((j=filled; j<bar_w; j++)); do bar_empty+="."; done
 
     bclear $((traj_top + 2)) $((LC + 2)) $((LW - 4))
-    btext $((traj_top + 2)) $((LC + 2)) "" "$(printf '  ${GRN}%s${D}%s${R}' "${bar:0:$filled}" "${bar:$filled}")"
+    tput cup $((traj_top + 2)) $((LC + 2))
+    printf "  %b%s%b%s%b" "$GRN" "$bar_full" "$D" "$bar_empty" "$R"
 
     bclear $((traj_top + 3)) $((LC + 2)) $((LW - 4))
     local pct=$(( progress * 100 / gap ))
-    btext $((traj_top + 3)) $((LC + 2)) "$D" "  ${pct}% of the way to 89ms"
+    local remaining=$((ms_num - target))
+    tput cup $((traj_top + 3)) $((LC + 2))
+    printf "  %b%d%%%b to target  |  %b%dms%b remaining" "$GRN" "$pct" "$R" "$YLW" "$remaining" "$R"
 
     bclear $((traj_top + 4)) $((LC + 2)) $((LW - 4))
 
