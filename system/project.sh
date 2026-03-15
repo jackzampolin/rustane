@@ -428,11 +428,12 @@ fi
 NEW_STATUS=$(grep "^status:" "$PROJECT_FILE" | head -1 | cut -d' ' -f2-)
 log "Status: $STATUS → $NEW_STATUS"
 
-# If status changed, loop to next step
+# If status changed, auto-advance by re-running (bash call, not exec)
 if [ "$NEW_STATUS" != "$STATUS" ] && [ "$NEW_STATUS" != "DONE" ] && [ "$NEW_STATUS" != "ABANDONED" ] && [ "$NEW_STATUS" != "READY_TO_MERGE" ]; then
-    log "Advancing to next step..."
+    log "Advancing to next step in 5s..."
     sleep 5
-    exec "$0" --project "$PROJECT" --model "$MODEL"
+    bash "$0" --project "$PROJECT" --model "$MODEL"
+    exit $?
 fi
 
 log "=== Project step complete ==="
