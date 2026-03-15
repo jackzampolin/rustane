@@ -2,6 +2,15 @@
 
 Instructions for AI agents working on this codebase. Read this before writing any code.
 
+## Branch Policy (CRITICAL — read this first)
+
+- **auto-max** is the stable performance branch. Only agent promotions go here.
+- **NEVER push system commits (scripts, docs, dashboard) directly to auto-max.**
+- System commits go to `system/infra` branch, merged into auto-max periodically.
+- If promotion to auto-max fails (non-fast-forward), RETRY with merge — never silently drop.
+- Before branching from auto-max, VERIFY it has all wins: check that no agent branch is ahead.
+- Bench comparisons must be direct (run baseline bench, not read from experiments.tsv).
+
 ## Build & Test
 
 ```bash
