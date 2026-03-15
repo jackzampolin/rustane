@@ -259,12 +259,19 @@ render() {
     local act_lines=$((act_h - 2))
     local act_row=$((act_top + 1))
 
-    # Read gossip into array (avoids subshell pipe problem)
+    # Read gossip into array — only timestamped lines [HH:MM], skip multi-line content
     local -a glines=()
     if [ -f "$GOSSIP" ]; then
         while IFS= read -r gline; do
-            glines+=("$gline")
-        done < <(tail -$act_lines "$GOSSIP" 2>/dev/null)
+            # Only show lines starting with [ (timestamps) or # (comments)
+            [[ "$gline" == "["* ]] || continue
+            glines+=("${gline:0:$((RW - 6))}")
+        done < <(tail -30 "$GOSSIP" 2>/dev/null)
+        # Keep only last N that fit
+        local total=${#glines[@]}
+        if [ $total -gt $act_lines ]; then
+            glines=("${glines[@]:$((total - act_lines))}")
+        fi
     fi
 
     for gline in "${glines[@]}"; do
