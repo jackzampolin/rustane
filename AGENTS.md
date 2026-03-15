@@ -64,6 +64,8 @@ These optimizations have been tried and PROVEN to not work on this hardware/mode
 | **Metal GPU for Adam optimizer** | 56 GPU dispatches = 99.8% driver overhead (0.03ms actual compute). CPU loop is faster. | 1 |
 | **Cross-layer dW pipeline** | dW sgemm already fully hidden by within-layer thread::scope overlaps. mpsc channel overhead + wait_current() serialization + cache thrashing added 5ms. | 1 |
 | **Pre-transpose weight cache** | All 6 transposes per backward call already run inside thread::scope overlapped with ANE. ANE is the bottleneck, not CPU transposes. Caching saves zero wall-clock. | 1 |
+| **Fused forward ANE kernels** | Full-layer forward fusion (90 ops) was 1ms/layer SLOWER. Larger fused IOSurface staging cost > dispatch savings (0.095ms). At hidden_dim=768, kernels are too small for fusion to help. | 3 |
+| **Fused backward ANE kernels** | All 3 combos tested (qkv +2ms, wot_sdpa1 +3.4ms, sdpa_bwd12 +1.2ms). Re-optimized dW schedule for fused layout — still no improvement. CPU never bottlenecked in overlap scopes. | 4 |
 
 ## What DOES Work
 
