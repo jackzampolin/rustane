@@ -383,10 +383,17 @@ When done: echo 'TEST: COMPLETE <ms/step>' > $STATUS_FILE"
     local agent_log="/tmp/rustane-phase-agent-output.log"
     : > "$agent_log"  # truncate
 
+    # Use default effort for research/planning (effort high thinks too long)
+    # Only use effort high for IMPLEMENT (where deep thinking helps)
+    local effort_flag=""
+    if [ "$substep" = "IMPLEMENT" ]; then
+        effort_flag="--effort high"
+    fi
+
     claude -p \
         --dangerously-skip-permissions \
         --model "$MODEL" \
-        --effort high \
+        $effort_flag \
         "$prompt" >> "$agent_log" 2>&1 &
     local agent_pid=$!
     echo "$agent_pid" > "/tmp/rustane-phase-agent.pid"
