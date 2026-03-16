@@ -338,17 +338,21 @@ When done: echo 'TEST: COMPLETE <ms/step>' > $STATUS_FILE"
     log "Running $substep agent for phase $phase..."
 
     local worktree="/tmp/rustane-worktree-phase${phase}"
+    local phase_branch="phase${phase}/work"
     cd "$REPO_ROOT"
     git fetch origin --quiet
     # Reuse existing worktree within same phase (preserves uncommitted work)
     if [ ! -d "$worktree" ]; then
-        git worktree add "$worktree" "v2/ane-training" 2>/dev/null || {
+        # Create phase-specific branch from v2/ane-training
+        git branch -f "$phase_branch" v2/ane-training 2>/dev/null || git branch "$phase_branch" v2/ane-training 2>/dev/null || true
+        git worktree add "$worktree" "$phase_branch" 2>/dev/null || {
             git worktree remove --force "$worktree" 2>/dev/null || rm -rf "$worktree"
-            git worktree add "$worktree" "v2/ane-training"
+            git branch -f "$phase_branch" v2/ane-training 2>/dev/null || true
+            git worktree add "$worktree" "$phase_branch"
         }
     else
         # Pull latest into existing worktree
-        cd "$worktree" && git pull origin v2/ane-training --quiet 2>/dev/null || true
+        cd "$worktree" && git merge origin/v2/ane-training --no-edit --quiet 2>/dev/null || true
         cd "$REPO_ROOT"
     fi
 
@@ -384,6 +388,7 @@ When done: echo 'TEST: COMPLETE <ms/step>' > $STATUS_FILE"
     claude -p \
         --dangerously-skip-permissions \
         --model "$MODEL" \
+        --effort high \
         "$prompt" > "$fifo" 2>&1 &
     local agent_pid=$!
     echo "$agent_pid" > "/tmp/rustane-phase-agent.pid"
