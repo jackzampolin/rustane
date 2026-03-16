@@ -223,7 +223,9 @@ impl RopeTable {
     }
 }
 
-/// Compiled kernels for one layer (shared across layers since same dims).
+/// Compiled kernels + per-layer IOSurface buffers.
+/// Kernels are shared across layers (same dims → same compiled program).
+/// Buffers are per-layer so weights can be pre-staged once after Adam.
 pub struct CompiledKernels {
     pub sdpa_fwd: Executable,
     pub wo_fwd: Executable,
@@ -238,10 +240,16 @@ pub struct CompiledKernels {
     pub sdpa_bwd2: Executable,
     pub q_bwd: Executable,
     pub kv_bwd: Executable,
-    /// Pre-allocated IOSurface buffers for all kernels (avoids alloc/dealloc per call).
+    /// Per-layer IOSurface buffers. Each layer has its own set so weights
+    /// can be pre-staged once after Adam (not re-staged every dispatch).
+    /// Index by layer: layer_bufs[layer_idx]
+    pub layer_bufs: Vec<KernelBuffers>,
+    /// Shared output buffers (outputs are transient, don't need per-layer).
     bufs: KernelBuffers,
     /// Pre-computed RoPE tables (avoids 12× per-step recomputation).
     pub rope: RopeTable,
+    /// Whether weights have been pre-staged into layer_bufs
+    pub weights_staged: bool,
 }
 
 impl CompiledKernels {
@@ -269,7 +277,11 @@ impl CompiledKernels {
         let kv_bwd = dyn_matmul::build_dual(cfg.kv_dim, cfg.dim, cfg.seq)
             .compile(qos).expect("kvBwd compile");
 
-        // Pre-allocate IOSurface buffers for all kernels
+        // Pre-allocate per-layer IOSurface buffers (weights will be pre-staged)
+        let layer_bufs: Vec<KernelBuffers> = (0..cfg.nlayers)
+            .map(|_| KernelBuffers::allocate(cfg))
+            .collect();
+        // Shared buffer set for backward pass outputs (transient, reused across layers)
         let bufs = KernelBuffers::allocate(cfg);
 
         // Pre-compute RoPE tables (deterministic, reused 12× per step)
@@ -280,7 +292,8 @@ impl CompiledKernels {
             ffn_fused_conv: Vec::new(),
             ffn_bwd_w2t, ffn_bwd_w13t, wot_bwd,
             sdpa_bwd1, sdpa_bwd2, q_bwd, kv_bwd,
-            bufs, rope,
+            layer_bufs, bufs, rope,
+            weights_staged: false,
         }
     }
 
@@ -317,6 +330,120 @@ impl CompiledKernels {
     /// Returns true if conv1x1 ffnFused is available (has been compiled).
     pub fn has_ffn_conv1x1(&self) -> bool {
         !self.ffn_fused_conv.is_empty()
+    }
+
+    /// Pre-stage all weights into per-layer IOSurface buffers.
+    /// Call once at init and after each Adam update.
+    /// After this, forward_into/backward_into only need to stage activations.
+    pub fn stage_all_weights(&mut self, cfg: &ModelConfig, layer_weights: &[LayerWeights]) {
+        let dim = cfg.dim;
+        let seq = cfg.seq;
+        let q_dim = cfg.q_dim;
+        let kv_dim = cfg.kv_dim;
+        let hidden = cfg.hidden;
+
+        for (l, lw) in layer_weights.iter().enumerate() {
+            let bufs = &self.layer_bufs[l];
+
+            // sdpaFwd weights: Wq, Wk, Wv in spatial dim
+            let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
+            {
+                let mut locked = bufs.sdpa_fwd_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                let kv_off = seq + q_dim;
+                for c in 0..dim {
+                    let row = c * sdpa_sp;
+                    buf[row + seq..row + seq + q_dim].copy_from_slice(&lw.wq[c * q_dim..c * q_dim + q_dim]);
+                    buf[row + kv_off..row + kv_off + kv_dim].copy_from_slice(&lw.wk[c * kv_dim..c * kv_dim + kv_dim]);
+                    buf[row + kv_off + kv_dim..row + kv_off + 2 * kv_dim].copy_from_slice(&lw.wv[c * kv_dim..c * kv_dim + kv_dim]);
+                }
+            }
+
+            // woFwd weights: Wo in spatial dim
+            let wo_sp = dyn_matmul::spatial_width(seq, dim);
+            {
+                let mut locked = bufs.wo_fwd_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                stage_spatial(buf, q_dim, wo_sp, &lw.wo, dim, seq);
+            }
+
+            // ffnFused weights: W1, W3, W2 in spatial dim
+            let ffn_sp = ffn_fused::input_spatial_width(cfg);
+            {
+                let mut locked = bufs.ffn_fused_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                let w_off = 2 * seq;
+                for c in 0..dim {
+                    let row = c * ffn_sp;
+                    buf[row + w_off..row + w_off + hidden].copy_from_slice(&lw.w1[c * hidden..c * hidden + hidden]);
+                    buf[row + w_off + hidden..row + w_off + 2 * hidden].copy_from_slice(&lw.w3[c * hidden..c * hidden + hidden]);
+                    buf[row + w_off + 2 * hidden..row + w_off + 3 * hidden].copy_from_slice(&lw.w2[c * hidden..c * hidden + hidden]);
+                }
+            }
+
+            // Backward weights: ffnBwdW2t (W2)
+            let w2t_sp = dyn_matmul::spatial_width(seq, hidden);
+            {
+                let mut locked = bufs.ffn_bwd_w2t_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                stage_spatial(buf, dim, w2t_sp, &lw.w2, hidden, seq);
+            }
+
+            // ffnBwdW13t: W1^T, W3^T (need transpose)
+            // These get transposed and staged — the current backward_into does this per-call
+            // We'll pre-compute the transposes and store in the buffer
+            let w13t_sp = dyn_matmul::dual_spatial_width(seq, dim);
+            {
+                let mut w1t = vec![0.0f32; dim * hidden];
+                let mut w3t = vec![0.0f32; dim * hidden];
+                crate::cpu::vdsp::mtrans(&lw.w1, hidden, &mut w1t, dim, dim, hidden);
+                crate::cpu::vdsp::mtrans(&lw.w3, hidden, &mut w3t, dim, dim, hidden);
+
+                let mut locked = bufs.ffn_bwd_w13t_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                stage_spatial(buf, hidden, w13t_sp, &w1t, dim, 2 * seq);
+                stage_spatial(buf, hidden, w13t_sp, &w3t, dim, 2 * seq + dim);
+            }
+
+            // wotBwd: Wo^T
+            let wot_sp = dyn_matmul::spatial_width(seq, q_dim);
+            {
+                let mut wot = vec![0.0f32; q_dim * dim];
+                crate::cpu::vdsp::mtrans(&lw.wo, dim, &mut wot, q_dim, q_dim, dim);
+
+                let mut locked = bufs.wot_bwd_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                stage_spatial(buf, dim, wot_sp, &wot, q_dim, seq);
+            }
+
+            // qBwd: Wq^T
+            let q_bwd_sp = dyn_matmul::spatial_width(seq, dim);
+            {
+                let mut wqt = vec![0.0f32; dim * q_dim];
+                crate::cpu::vdsp::mtrans(&lw.wq, q_dim, &mut wqt, dim, dim, q_dim);
+
+                let mut locked = bufs.q_bwd_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                stage_spatial(buf, q_dim, q_bwd_sp, &wqt, dim, seq);
+            }
+
+            // kvBwd: Wk^T, Wv^T
+            let kv_bwd_sp = dyn_matmul::dual_spatial_width(seq, dim);
+            {
+                let mut wkt = vec![0.0f32; dim * kv_dim];
+                let mut wvt = vec![0.0f32; dim * kv_dim];
+                crate::cpu::vdsp::mtrans(&lw.wk, kv_dim, &mut wkt, dim, dim, kv_dim);
+                crate::cpu::vdsp::mtrans(&lw.wv, kv_dim, &mut wvt, dim, dim, kv_dim);
+
+                let mut locked = bufs.kv_bwd_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                // Stage wkt and wvt into the weight portion of the dual IOSurface
+                stage_spatial(buf, kv_dim, kv_bwd_sp, &wkt, dim, 2 * seq);
+                stage_spatial(buf, kv_dim, kv_bwd_sp, &wvt, dim, 2 * seq + dim);
+            }
+        }
+
+        self.weights_staged = true;
     }
 }
 
