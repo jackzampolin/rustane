@@ -242,10 +242,12 @@ pub struct CompiledKernels {
     pub kv_bwd: Executable,
     /// Per-layer IOSurface buffers. Each layer has its own set so weights
     /// can be pre-staged once after Adam (not re-staged every dispatch).
-    /// Index by layer: layer_bufs[layer_idx]
+    /// When weights_staged=true, forward/backward use layer_bufs[l] for inputs.
+    /// When weights_staged=false, fallback to bufs (shared, re-staged every call).
     pub layer_bufs: Vec<KernelBuffers>,
-    /// Shared output buffers (outputs are transient, don't need per-layer).
-    bufs: KernelBuffers,
+    /// Shared buffer set (used when weights_staged=false, or for functions
+    /// that don't have a layer index). Also used for output buffers.
+    pub bufs: KernelBuffers,
     /// Pre-computed RoPE tables (avoids 12× per-step recomputation).
     pub rope: RopeTable,
     /// Whether weights have been pre-staged into layer_bufs
@@ -330,6 +332,17 @@ impl CompiledKernels {
     /// Returns true if conv1x1 ffnFused is available (has been compiled).
     pub fn has_ffn_conv1x1(&self) -> bool {
         !self.ffn_fused_conv.is_empty()
+    }
+
+    /// Get the input buffer set for a given layer.
+    /// When weights are pre-staged, returns per-layer buffers (weights already there).
+    /// Otherwise returns shared buffers (weights will be staged per-call).
+    pub fn input_bufs(&self, layer_idx: usize) -> &KernelBuffers {
+        if self.weights_staged && layer_idx < self.layer_bufs.len() {
+            &self.layer_bufs[layer_idx]
+        } else {
+            &self.bufs
+        }
     }
 
     /// Pre-stage all weights into per-layer IOSurface buffers.
