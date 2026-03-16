@@ -463,8 +463,8 @@ start_heartbeat_loop
 if [ "$SUBSTEP" = "REFERENCE" ] && [ "$BASELINE_MS" -eq 195 ]; then
     log "Measuring baseline before Phase $PHASE..."
     echo "BASELINE: measuring" > "$STATUS_FILE"
-    local bench_out=$(cargo test -p engine --test bench_step_time --release -- bench_training_step_1024 --ignored --nocapture 2>&1)
-    BASELINE_MS=$(echo "$bench_out" | grep -E "^[2-4]" | awk '{sum+=$2; n++} END {printf "%.0f", sum/n}')
+    BENCH_OUT=$(cargo test -p engine --test bench_step_time --release -- bench_training_step_1024 --ignored --nocapture 2>&1)
+    BASELINE_MS=$(echo "$BENCH_OUT" | grep -E "^[2-4]" | awk '{sum+=$2; n++} END {printf "%.0f", sum/n}')
     log "Baseline measured: ${BASELINE_MS}ms"
     gossip "Baseline: ${BASELINE_MS}ms"
     save_state
@@ -483,12 +483,12 @@ while [ "$PHASE" -le 5 ]; do
 
     # Check inject (applies to next agent session)
     INJECT_EXTRA=""
-    local inject=$(check_inject)
-    if [ -n "$inject" ]; then
+    INJECT_RESULT=$(check_inject)
+    if [ -n "$INJECT_RESULT" ]; then
         INJECT_EXTRA="
 
 ADDITIONAL INSTRUCTIONS FROM OPERATOR:
-$inject"
+$INJECT_RESULT"
     fi
 
     log "--- Phase $PHASE, Substep $SUBSTEP (session $SESSIONS, retry $RETRIES) ---"
@@ -506,9 +506,9 @@ $inject"
 
     # Check if agent stalled (no status update for 20+ minutes)
     if [ -f "$STATUS_FILE" ]; then
-        local status_age=$(( $(date +%s) - $(stat -f%m "$STATUS_FILE" 2>/dev/null || echo "0") ))
-        if [ "$status_age" -gt 1200 ] && [ "$SUBSTEP" != "GATE" ]; then
-            alert "WARN" "Agent status unchanged for $((status_age/60))min — may be stuck"
+        STATUS_AGE=$(( $(date +%s) - $(stat -f%m "$STATUS_FILE" 2>/dev/null || echo "0") ))
+        if [ "$STATUS_AGE" -gt 1200 ] && [ "$SUBSTEP" != "GATE" ]; then
+            alert "WARN" "Agent status unchanged for $((STATUS_AGE/60))min — may be stuck"
         fi
     fi
 
