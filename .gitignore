@@ -10,3 +10,5 @@ models/
 *.log
 .env
 .DS_Store
+checkpoints/
+.claude/
