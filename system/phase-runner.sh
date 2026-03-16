@@ -338,16 +338,19 @@ When done: echo 'TEST: COMPLETE <ms/step>' > $STATUS_FILE"
     log "Running $substep agent for phase $phase..."
 
     local worktree="/tmp/rustane-worktree-phase${phase}"
-    if [ -d "$worktree" ]; then
-        cd "$REPO_ROOT"
-        git worktree remove --force "$worktree" 2>/dev/null || rm -rf "$worktree"
-    fi
     cd "$REPO_ROOT"
     git fetch origin --quiet
-    git worktree add "$worktree" "v2/ane-training" 2>/dev/null || {
-        git worktree remove --force "$worktree" 2>/dev/null || rm -rf "$worktree"
-        git worktree add "$worktree" "v2/ane-training"
-    }
+    # Reuse existing worktree within same phase (preserves uncommitted work)
+    if [ ! -d "$worktree" ]; then
+        git worktree add "$worktree" "v2/ane-training" 2>/dev/null || {
+            git worktree remove --force "$worktree" 2>/dev/null || rm -rf "$worktree"
+            git worktree add "$worktree" "v2/ane-training"
+        }
+    else
+        # Pull latest into existing worktree
+        cd "$worktree" && git pull origin v2/ane-training --quiet 2>/dev/null || true
+        cd "$REPO_ROOT"
+    fi
 
     # Copy dev/ context
     if [ -d "${REPO_ROOT}/dev" ]; then
@@ -400,14 +403,54 @@ When done: echo 'TEST: COMPLETE <ms/step>' > $STATUS_FILE"
 
     if [ $exit_code -ne 0 ]; then
         log "Agent failed or timed out"
-        echo "$substep: FAILED" > "$STATUS_FILE"
+        echo "$substep: FAILED (exit $exit_code)" > "$STATUS_FILE"
+        gossip "Agent FAILED (exit $exit_code) at Phase $phase $substep"
+        alert "WARN" "Agent failed at Phase $phase $substep (exit $exit_code)"
     fi
 
-    # Advance substep
-    SUBSTEP=$(next_substep "$substep")
+    # Validate substep output exists before advancing
+    local advance=true
+    case "$substep" in
+        REFERENCE)
+            if [ ! -f "/tmp/rustane-phase${phase}-reference.md" ]; then
+                alert "WARN" "REFERENCE substep produced no output — retrying"
+                advance=false
+            fi
+            ;;
+        RESEARCH)
+            if [ ! -f "/tmp/rustane-phase${phase}-research.md" ]; then
+                alert "WARN" "RESEARCH substep produced no output — retrying"
+                advance=false
+            fi
+            ;;
+        PLAN)
+            if [ ! -f "/tmp/rustane-phase${phase}-plan.md" ]; then
+                alert "WARN" "PLAN substep produced no output — retrying"
+                advance=false
+            fi
+            ;;
+        IMPLEMENT)
+            # Check if any commits were made
+            local new_commits=$(cd "$worktree" && git log --oneline HEAD --not "phase${phase}-start" 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$new_commits" -eq 0 ] && [ $exit_code -ne 0 ]; then
+                alert "WARN" "IMPLEMENT substep made no commits — retrying"
+                advance=false
+            fi
+            ;;
+    esac
+
     SESSIONS=$((SESSIONS + 1))
+
+    if $advance; then
+        SUBSTEP=$(next_substep "$substep")
+        log "Advanced to substep: $SUBSTEP"
+        gossip "Advanced to Phase $phase $SUBSTEP"
+    else
+        log "Substep $substep did not produce expected output — staying"
+        gossip "Retrying Phase $phase $substep (no output)"
+    fi
+
     save_state
-    log "Advanced to substep: $SUBSTEP"
 }
 
 # --- Main Loop ---
@@ -415,6 +458,17 @@ log "=== Phase Runner starting (Phase $PHASE, Substep $SUBSTEP) ==="
 gossip "ONLINE — Phase $PHASE, Substep $SUBSTEP"
 git tag "phase${PHASE}-start" HEAD 2>/dev/null || true
 start_heartbeat_loop
+
+# Auto-measure baseline at phase start (if not already set)
+if [ "$SUBSTEP" = "REFERENCE" ] && [ "$BASELINE_MS" -eq 195 ]; then
+    log "Measuring baseline before Phase $PHASE..."
+    echo "BASELINE: measuring" > "$STATUS_FILE"
+    local bench_out=$(cargo test -p engine --test bench_step_time --release -- bench_training_step_1024 --ignored --nocapture 2>&1)
+    BASELINE_MS=$(echo "$bench_out" | grep -E "^[2-4]" | awk '{sum+=$2; n++} END {printf "%.0f", sum/n}')
+    log "Baseline measured: ${BASELINE_MS}ms"
+    gossip "Baseline: ${BASELINE_MS}ms"
+    save_state
+fi
 
 while [ "$PHASE" -le 5 ]; do
     # Check pause
