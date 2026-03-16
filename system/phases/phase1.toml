@@ -1,0 +1,58 @@
+[phase]
+name = "iosurface-architecture"
+number = 1
+description = "Fix IOSurface architecture: fp16 buffers, per-layer allocation, pre-created requests, pre-transposed weights, stage weights once after Adam"
+branch = "v2/ane-training"
+
+[targets]
+ms_per_step_target = 140
+baseline_ms = 195
+theoretical_min_ms = 43
+min_improvement_pct = 10
+regression_threshold_pct = 5
+
+[tests]
+required = [
+    "cargo test -p engine --release",
+    "cargo test -p engine --test phase3_kernels --release",
+    "cargo test -p engine --test phase4_training --release",
+]
+gate_test = "cargo test -p engine --test gate_phase1 --release -- --nocapture"
+bench_test = "cargo test -p engine --test gate_phase1 --release -- --ignored --nocapture"
+bench_runs = 5
+
+[reference]
+files = [
+    "/Users/dan/Dev/autoresearch-ANE/native/runtime/io.h",
+    "/Users/dan/Dev/autoresearch-ANE/native/training/train.m:376-409",
+    "/Users/dan/Dev/autoresearch-ANE/native/runtime/config.h",
+    "/Users/dan/Dev/pmetal/crates/pmetal-metal/src/ane/iosurface.rs",
+    "/Users/dan/Dev/pmetal/crates/pmetal-metal/src/neon_convert.rs",
+]
+comparison_areas = [
+    "IOSurface dtype: maderix uses fp16, we use fp32. How do they do NEON conversion?",
+    "Buffer allocation: maderix has PerLayerSurfaces, we share. How many per layer?",
+    "Weight staging frequency: maderix stages once after Adam, we stage 102x/step",
+    "ANE request management: maderix pre-creates requests, we create per-dispatch",
+    "Weight transpose: maderix transposes once after Adam, we do 560x/step",
+]
+
+[budget]
+max_sessions = 6
+max_retries = 3
+session_timeout_min = 180
+
+[context]
+our_code = [
+    "crates/ane-bridge/src/lib.rs",
+    "/Users/dan/Dev/ane-crate/crates/ane/src/tensor_data.rs",
+    "/Users/dan/Dev/ane-crate/crates/ane/src/executable.rs",
+    "crates/engine/src/layer.rs:85-320",
+    "crates/engine/src/layer.rs:460-750",
+    "crates/engine/src/full_model.rs:656-716",
+]
+docs = [
+    "dev/plans/architecture-v2-synthesis.md",
+    "dev/plans/MASTER_PLAN.md:Phase1",
+    "AGENTS.md",
+]

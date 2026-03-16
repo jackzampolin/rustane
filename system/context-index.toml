@@ -1,0 +1,51 @@
+# Context Index — maps topics to relevant files for agent context curation
+# Curator agents use this to pull ONLY relevant files per phase/task
+
+[iosurface]
+our_code = [
+    "/Users/dan/Dev/ane-crate/crates/ane/src/tensor_data.rs",
+    "/Users/dan/Dev/ane-crate/crates/ane/src/executable.rs",
+    "crates/engine/src/layer.rs:85-320",
+]
+reference = [
+    "/Users/dan/Dev/autoresearch-ANE/native/runtime/io.h",
+    "/Users/dan/Dev/pmetal/crates/pmetal-metal/src/ane/iosurface.rs",
+]
+docs = ["dev/plans/architecture-v2-synthesis.md"]
+
+[staging]
+our_code = ["crates/engine/src/layer.rs:460-750"]
+reference = [
+    "/Users/dan/Dev/autoresearch-ANE/native/training/train.m:376-500",
+    "/Users/dan/Dev/pmetal/crates/pmetal-metal/src/neon_convert.rs",
+]
+
+[dispatch]
+our_code = ["/Users/dan/Dev/ane-crate/crates/ane/src/executable.rs"]
+reference = ["/Users/dan/Dev/autoresearch-ANE/native/runtime/io.h:99-150"]
+
+[backward]
+our_code = ["crates/engine/src/layer.rs:1200-1700"]
+reference = ["/Users/dan/Dev/autoresearch-ANE/native/training/train.m:500-800"]
+
+[metal_gpu]
+reference = [
+    "/Users/dan/Dev/pmetal/crates/pmetal-metal/src/async_scheduler.rs",
+    "/Users/dan/Dev/pmetal/crates/pmetal-metal/src/kernels/metal/fused_training.metal",
+    "/Users/dan/Dev/pmetal/crates/pmetal-metal/src/kernels/metal/flash_attention.metal",
+]
+
+[optimizer]
+our_code = ["crates/engine/src/full_model.rs:540-620"]
+reference = [
+    "/Users/dan/Dev/autoresearch-ANE/native/training/cpu_ops.h:56-64",
+    "/Users/dan/Dev/pmetal/crates/pmetal-trainer/src/mlx_metal_optimizer.rs",
+]
+
+[model_config]
+our_code = ["crates/engine/src/model.rs"]
+reference = ["/Users/dan/Dev/autoresearch-ANE/native/training/models/"]
+
+[kernels]
+our_code = ["crates/engine/src/kernels/"]
+reference = ["/Users/dan/Dev/autoresearch-ANE/native/mil/mil_dynamic.h"]
