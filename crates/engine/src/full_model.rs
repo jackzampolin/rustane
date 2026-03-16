@@ -511,45 +511,57 @@ pub fn update_weights(
         gamma_final_m: ref mut o_gfm, gamma_final_v: ref mut o_gfv,
     } = *opt;
 
-    // 3-way split: balanced across nlayers (dynamic, not hardcoded).
+    // 4-way split: balanced across nlayers (dynamic, not hardcoded).
     // Thread 1 also handles embed+gamma_final, so gets slightly fewer layers.
     // Each param: 28 bytes memory traffic (read grad/m/v/param, write m/v/param).
-    // 3 threads → ~50% more memory bandwidth than 2 threads.
-    // 6 layers → (2,2,2), 8 layers → (3,3,2), 12 → (4,4,4)
+    // 4 threads → ~100% more memory bandwidth than 2 threads on M4 Max.
+    // 6 layers → (1,1,2,2), 8 layers → (2,2,2,2), 12 → (3,3,3,3)
     let nl = w_layers.len();
-    let g1 = (nl + 2) / 3;
-    let g2 = (nl - g1 + 1) / 2;
-    let (wl_01, wl_2345) = w_layers.split_at_mut(g1);
-    let (wl_23, wl_45) = wl_2345.split_at_mut(g2);
-    let (gl_01, gl_2345) = g_layers.split_at(g1);
-    let (gl_23, gl_45) = gl_2345.split_at(g2);
-    let (ol_01, ol_2345) = o_layers.split_at_mut(g1);
-    let (ol_23, ol_45) = ol_2345.split_at_mut(g2);
+    let g1 = nl / 4;
+    let g2 = (nl - g1) / 3;
+    let g3 = (nl - g1 - g2) / 2;
+    let (wl_a, wl_rest) = w_layers.split_at_mut(g1);
+    let (wl_b, wl_rest) = wl_rest.split_at_mut(g2);
+    let (wl_c, wl_d) = wl_rest.split_at_mut(g3);
+    let (gl_a, gl_rest) = g_layers.split_at(g1);
+    let (gl_b, gl_rest) = gl_rest.split_at(g2);
+    let (gl_c, gl_d) = gl_rest.split_at(g3);
+    let (ol_a, ol_rest) = o_layers.split_at_mut(g1);
+    let (ol_b, ol_rest) = ol_rest.split_at_mut(g2);
+    let (ol_c, ol_d) = ol_rest.split_at_mut(g3);
 
     std::thread::scope(|s| {
-        // Thread 1: embed + gamma_final + layers 0-1 (~19M)
+        // Thread 1: embed + gamma_final + layers[0..g1]
         let h1 = s.spawn(move || {
             step_fused(w_embed, g_embed, o_em, o_ev, t, embed_lr, b1, b2, eps, 0.0, grad_scale);
             step_fused(w_gf, g_gf, o_gfm, o_gfv, t, lr, b1, b2, eps, 0.0, grad_scale);
-            for l in 0..wl_01.len() {
-                update_layer(&mut wl_01[l], &gl_01[l], &mut ol_01[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
+            for l in 0..wl_a.len() {
+                update_layer(&mut wl_a[l], &gl_a[l], &mut ol_a[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
             }
         });
 
-        // Thread 2: layers 2-3 (~13M)
+        // Thread 2: layers[g1..g1+g2]
         let h2 = s.spawn(move || {
-            for l in 0..wl_23.len() {
-                update_layer(&mut wl_23[l], &gl_23[l], &mut ol_23[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
+            for l in 0..wl_b.len() {
+                update_layer(&mut wl_b[l], &gl_b[l], &mut ol_b[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
             }
         });
 
-        // Main thread: layers 4-5 (~13M)
-        for l in 0..wl_45.len() {
-            update_layer(&mut wl_45[l], &gl_45[l], &mut ol_45[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
+        // Thread 3: layers[g1+g2..g1+g2+g3]
+        let h3 = s.spawn(move || {
+            for l in 0..wl_c.len() {
+                update_layer(&mut wl_c[l], &gl_c[l], &mut ol_c[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
+            }
+        });
+
+        // Main thread: layers[g1+g2+g3..]
+        for l in 0..wl_d.len() {
+            update_layer(&mut wl_d[l], &gl_d[l], &mut ol_d[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
         }
 
         h1.join().expect("Adam thread 1 panicked");
         h2.join().expect("Adam thread 2 panicked");
+        h3.join().expect("Adam thread 3 panicked");
     });
 }
 
