@@ -159,3 +159,97 @@ fn sweep_model_configs() {
 
     println!("\n=== Done ===\n");
 }
+
+#[test]
+#[ignore]
+fn sweep_large_configs() {
+    println!("\n=== Large Config Sweep — Pushing Past 1024 ===\n");
+    println!("{:<25} {:>4}  {:>5}  {:>5}  {:>4} | {:>8} {:>8} {:>8} | {:>7} | {:>11} | {:>10} | {:>12} | overhead",
+        "config", "L", "dim", "hid", "seq", "fwd", "bwd", "total", "per-L", "params", "FLOP", "ANE compute");
+    println!("{}", "-".repeat(170));
+
+    let configs: Vec<(&str, usize, usize, usize, usize, usize)> = vec![
+        // (name, dim, hidden, heads, seq, nlayers)
+        ("1024-8L-seq256",  1024, 2816, 8,  256, 8),
+        ("1024-8L-seq512",  1024, 2816, 8,  512, 8),
+        ("1024-12L-seq256", 1024, 2816, 8,  256, 12),
+        ("1536-8L-seq256",  1536, 4096, 12, 256, 8),
+        ("1536-8L-seq512",  1536, 4096, 12, 512, 8),
+        ("2048-6L-seq256",  2048, 5632, 16, 256, 6),
+        ("2048-8L-seq256",  2048, 5632, 16, 256, 8),
+        ("2048-4L-seq512",  2048, 5632, 16, 512, 4),
+        ("3072-4L-seq256",  3072, 8192, 24, 256, 4),
+        ("4096-2L-seq256",  4096, 11264,32, 256, 2),
+    ];
+
+    for (name, dim, hidden, heads, seq, nlayers) in configs {
+        let cfg = ModelConfig {
+            dim, hidden, heads, kv_heads: heads, hd: 128,
+            seq, nlayers, vocab: 8192, q_dim: dim, kv_dim: dim, gqa_ratio: 1,
+        };
+        bench_config(name, &cfg);
+    }
+
+    println!("\n=== Done ===\n");
+}
+
+#[test]
+#[ignore]
+fn sweep_extreme_configs() {
+    println!("\n=== EXTREME Config Sweep — 2048+ dims, various shapes ===\n");
+    println!("{:<30} {:>4}  {:>5}  {:>5}  {:>4} | {:>8} {:>8} {:>8} | {:>7} | {:>11} | {:>10} | {:>12} | overhead",
+        "config", "L", "dim", "hid", "seq", "fwd", "bwd", "total", "per-L", "params", "FLOP", "ANE compute");
+    println!("{}", "-".repeat(175));
+
+    let configs: Vec<(&str, usize, usize, usize, usize, usize)> = vec![
+        // 2048 dim — vary everything
+        ("2048-2L-seq128",  2048, 5632, 16, 128, 2),
+        ("2048-2L-seq256",  2048, 5632, 16, 256, 2),
+        ("2048-2L-seq512",  2048, 5632, 16, 512, 2),
+        ("2048-4L-seq128",  2048, 5632, 16, 128, 4),
+        ("2048-4L-seq256",  2048, 5632, 16, 256, 4),
+        ("2048-6L-seq128",  2048, 5632, 16, 128, 6),
+        ("2048-8L-seq128",  2048, 5632, 16, 128, 8),
+        ("2048-12L-seq128", 2048, 5632, 16, 128, 12),
+
+        // 2048 — vary hidden ratio
+        ("2048-4L-h4096",   2048, 4096, 16, 256, 4),
+        ("2048-4L-h5632",   2048, 5632, 16, 256, 4),
+        ("2048-4L-h8192",   2048, 8192, 16, 256, 4),
+
+        // 3072 — test SRAM cliff
+        ("3072-2L-seq128",  3072, 8192, 24, 128, 2),
+        ("3072-2L-seq256",  3072, 8192, 24, 256, 2),
+        ("3072-4L-seq128",  3072, 8192, 24, 128, 4),
+        ("3072-2L-seq512",  3072, 8192, 24, 512, 2),
+
+        // 4096 — extreme
+        ("4096-1L-seq64",   4096, 11264, 32, 64,  1),
+        ("4096-1L-seq128",  4096, 11264, 32, 128, 1),
+        ("4096-1L-seq256",  4096, 11264, 32, 256, 1),
+        ("4096-2L-seq64",   4096, 11264, 32, 64,  2),
+        ("4096-2L-seq128",  4096, 11264, 32, 128, 2),
+        ("4096-2L-seq256",  4096, 11264, 32, 256, 2),
+        ("4096-4L-seq64",   4096, 11264, 32, 64,  4),
+        ("4096-4L-seq128",  4096, 11264, 32, 128, 4),
+
+        // 4096 — vary hidden
+        ("4096-2L-h8192",   4096, 8192,  32, 128, 2),
+        ("4096-2L-h11264",  4096, 11264, 32, 128, 2),
+        ("4096-2L-h16384",  4096, 16384, 32, 128, 2),
+
+        // 6144/8192 — can ANE even handle this?
+        ("6144-1L-seq64",   6144, 16384, 48, 64,  1),
+        ("8192-1L-seq64",   8192, 22528, 64, 64,  1),
+    ];
+
+    for (name, dim, hidden, heads, seq, nlayers) in configs {
+        let cfg = ModelConfig {
+            dim, hidden, heads, kv_heads: heads, hd: 128,
+            seq, nlayers, vocab: 8192, q_dim: dim, kv_dim: dim, gqa_ratio: 1,
+        };
+        bench_config(name, &cfg);
+    }
+
+    println!("\n=== Done ===\n");
+}
