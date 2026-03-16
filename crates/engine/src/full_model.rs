@@ -674,7 +674,42 @@ pub fn train_step(
     let mut total_loss = 0.0f32;
     let max_pos = data.len() - seq - 1;
 
+    // === BACKGROUND CONV1X1: compile during first microbatch ===
+    // Spawn compile thread BEFORE first microbatch. The compile uses current weights
+    // (updated by Adam at end of previous step). First microbatch runs matmul path
+    // while compile finishes. Microbatches 2+ use conv1x1.
+    let mut compile_handle: Option<std::thread::JoinHandle<Vec<_>>> = if tc.accum_steps > 1 {
+        // Clone weight data for the compile thread (compile needs &[f32], training needs &mut)
+        let cfg_clone = cfg.clone();
+        let layer_weights: Vec<_> = weights.layers.iter().map(|lw| {
+            crate::layer::LayerWeights {
+                wq: lw.wq.clone(), wk: lw.wk.clone(), wv: lw.wv.clone(),
+                wo: lw.wo.clone(), w1: lw.w1.clone(), w3: lw.w3.clone(),
+                w2: lw.w2.clone(), gamma1: lw.gamma1.clone(), gamma2: lw.gamma2.clone(),
+            }
+        }).collect();
+        Some(std::thread::spawn(move || {
+            crate::layer::CompiledKernels::compile_ffn_conv1x1_standalone(&cfg_clone, &layer_weights)
+        }))
+    } else {
+        None
+    };
+
     for _micro in 0..tc.accum_steps {
+        // After first microbatch: wait for compile and swap in conv1x1 kernels
+        if _micro == 1 {
+            if let Some(handle) = compile_handle.take() {
+                match handle.join() {
+                    Ok(conv_executables) => {
+                        kernels.install_ffn_conv1x1(conv_executables);
+                    }
+                    Err(_) => {
+                        eprintln!("Warning: conv1x1 compile thread panicked");
+                    }
+                }
+            }
+        }
+
         // Random position (simple LCG)
         let pos = ((step as u64 * 7919 + _micro as u64 * 104729) % max_pos as u64) as usize;
         let input_tokens: Vec<u32> = data[pos..pos + seq].iter().map(|&t| t as u32).collect();
@@ -690,6 +725,14 @@ pub fn train_step(
         );
     }
 
+    // If compile didn't finish during microbatch 1 (single microbatch or fast training),
+    // wait for it now before the next step
+    if let Some(handle) = compile_handle.take() {
+        if let Ok(conv_executables) = handle.join() {
+            kernels.install_ffn_conv1x1(conv_executables);
+        }
+    }
+
     // Compute grad norm for clip decision (single read pass over ~168MB)
     let gsc = 1.0 / (tc.accum_steps as f32 * tc.loss_scale);
     let raw_norm = grad_norm(grads);
@@ -703,15 +746,11 @@ pub fn train_step(
     // LR schedule
     let lr = learning_rate(step, tc);
 
-    // Weight update with fused grad scaling (GPU applies grad * combined_scale inline)
-    // Eliminates separate CPU sscal pass over ~168MB
+    // Weight update with fused grad scaling
     update_weights(cfg, weights, grads, opt, step + 1, lr, tc, metal_adam, combined_scale);
 
-    // Recompile conv1x1 ffnFused with updated weights (parallel across layers).
-    // ~40ms total (6 layers ÷ 6 threads). Must happen before next step's forward pass.
-    if kernels.has_ffn_conv1x1() {
-        kernels.recompile_ffn_conv1x1(cfg, &weights.layers);
-    }
+    // NOTE: conv1x1 recompile happens at START of next step (background during first microbatch)
+    // No synchronous recompile needed here.
 
     total_loss / tc.accum_steps as f32
 }

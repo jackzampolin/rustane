@@ -298,9 +298,20 @@ impl CompiledKernels {
         })
     }
 
-    /// Recompile per-layer conv1x1 ffnFused after optimizer step.
+    /// Recompile per-layer conv1x1 ffnFused after optimizer step (synchronous).
     pub fn recompile_ffn_conv1x1(&mut self, cfg: &ModelConfig, layer_weights: &[LayerWeights]) {
         self.ffn_fused_conv = Self::compile_ffn_conv1x1(cfg, layer_weights);
+    }
+
+    /// Compile conv1x1 ffnFused as a standalone function (for background thread).
+    /// Returns Vec<Executable> that can be installed via install_ffn_conv1x1().
+    pub fn compile_ffn_conv1x1_standalone(cfg: &ModelConfig, layer_weights: &[LayerWeights]) -> Vec<Executable> {
+        Self::compile_ffn_conv1x1(cfg, layer_weights)
+    }
+
+    /// Install pre-compiled conv1x1 executables (from background compile thread).
+    pub fn install_ffn_conv1x1(&mut self, executables: Vec<Executable>) {
+        self.ffn_fused_conv = executables;
     }
 
     /// Returns true if conv1x1 ffnFused is available (has been compiled).
