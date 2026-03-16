@@ -379,30 +379,42 @@ When done: echo 'TEST: COMPLETE <ms/step>' > $STATUS_FILE"
         timeout=1800  # 30 min for research/planning
     fi
 
-    local fifo="/tmp/rustane-phase-fifo"
-    rm -f "$fifo"
-    mkfifo "$fifo"
-    tee -a "$LOG_FILE" < "$fifo" &
-    local tee_pid=$!
+    # Run agent in background, log to file directly (NO FIFO — FIFO blocks watchdog)
+    local agent_log="/tmp/rustane-phase-agent-output.log"
+    : > "$agent_log"  # truncate
 
     claude -p \
         --dangerously-skip-permissions \
         --model "$MODEL" \
         --effort high \
-        "$prompt" > "$fifo" 2>&1 &
+        "$prompt" >> "$agent_log" 2>&1 &
     local agent_pid=$!
     echo "$agent_pid" > "/tmp/rustane-phase-agent.pid"
     log "Agent PID=$agent_pid (timeout: ${timeout}s, substep: $substep)"
 
-    # Watchdog
-    (sleep "$timeout" && kill "$agent_pid" 2>/dev/null) &
+    # Watchdog: independent process, kills by PID (not blocked by FIFO)
+    (
+        sleep "$timeout"
+        if kill -0 "$agent_pid" 2>/dev/null; then
+            echo "[$(date '+%H:%M:%S')] WATCHDOG: killing agent PID=$agent_pid after ${timeout}s" >> "$LOG_FILE"
+            kill "$agent_pid" 2>/dev/null
+            sleep 3
+            kill -9 "$agent_pid" 2>/dev/null || true
+        fi
+    ) &
     local watchdog=$!
 
+    # Wait for agent (or watchdog kill)
     wait "$agent_pid" 2>/dev/null
     local exit_code=$?
-    wait "$tee_pid" 2>/dev/null || true
-    rm -f "$fifo" "/tmp/rustane-phase-agent.pid"
+
+    # Cancel watchdog
     kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+
+    # Append agent output to main log
+    cat "$agent_log" >> "$LOG_FILE"
+    rm -f "/tmp/rustane-phase-agent.pid"
 
     log "Agent exited with code $exit_code"
 
