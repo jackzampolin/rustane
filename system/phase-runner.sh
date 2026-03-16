@@ -17,9 +17,69 @@ STATE_FILE="/tmp/rustane-phase-state.env"
 STATUS_FILE="/tmp/rustane-phase-status"
 LOG_FILE="/tmp/rustane-phase-runner.log"
 PAUSE_FILE="/tmp/rustane-phase-PAUSE"
+INJECT_FILE="/tmp/rustane-phase-INJECT"
+GOSSIP_FILE="/tmp/rustane-gossip.md"
+HEARTBEAT_FILE="/tmp/rustane-phase-heartbeat"
+ALERT_FILE="/tmp/rustane-phase-ALERT"
 MODEL="claude-opus-4-6"
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
+
+gossip() { echo "[$(date '+%H:%M:%S')] [phase-runner] $*" >> "$GOSSIP_FILE"; }
+
+heartbeat() {
+    # Write heartbeat with current state so monitors can detect stalls
+    cat > "$HEARTBEAT_FILE" << HEOF
+phase=$PHASE
+substep=$SUBSTEP
+agent_status=$(cat "$STATUS_FILE" 2>/dev/null || echo "unknown")
+agent_pid=$(cat /tmp/rustane-phase-agent.pid 2>/dev/null || echo "0")
+timestamp=$(date +%s)
+human_time=$(date '+%H:%M:%S')
+sessions=$SESSIONS
+retries=$RETRIES
+HEOF
+}
+
+alert() {
+    # Write alert file for monitors (cron/dashboard can read this)
+    local level=$1
+    shift
+    echo "[$(date '+%H:%M:%S')] [$level] $*" >> "$ALERT_FILE"
+    gossip "ALERT ($level): $*"
+    log "ALERT ($level): $*"
+}
+
+check_inject() {
+    # Check for injected instructions from operator
+    if [ -f "$INJECT_FILE" ]; then
+        local inject_content=$(cat "$INJECT_FILE")
+        rm -f "$INJECT_FILE"
+        log "INJECT: loaded operator instructions"
+        gossip "INJECT: $(echo "$inject_content" | head -1 | cut -c1-80)"
+        echo "$inject_content"
+    fi
+}
+
+# Heartbeat watchdog: runs in background, writes heartbeat every 30s
+start_heartbeat_loop() {
+    (
+        while true; do
+            heartbeat
+            sleep 30
+        done
+    ) &
+    HEARTBEAT_PID=$!
+}
+
+stop_heartbeat_loop() {
+    if [ -n "${HEARTBEAT_PID:-}" ]; then
+        kill "$HEARTBEAT_PID" 2>/dev/null || true
+        wait "$HEARTBEAT_PID" 2>/dev/null || true
+    fi
+}
+
+trap 'stop_heartbeat_loop; log "Phase runner exiting"' EXIT
 
 # --- State Management (simple env file, not TOML for now) ---
 load_state() {
@@ -224,12 +284,14 @@ When done: echo 'TEST: COMPLETE <ms/step>' > $STATUS_FILE"
             if ! $all_pass; then
                 log "GATE FAIL: tests failed"
                 echo "GATE: FAIL (tests)" > "$STATUS_FILE"
+                gossip "GATE FAIL: Phase $phase tests failed (retry $((RETRIES+1))/3)"
                 RETRIES=$((RETRIES + 1))
                 if [ $RETRIES -ge 3 ]; then
-                    log "ESCALATE: 3 gate failures. Pausing for human review."
+                    alert "ESCALATE" "3 gate failures on Phase $phase. Human review needed."
                     touch "$PAUSE_FILE"
                     SUBSTEP="IMPLEMENT"
                 else
+                    alert "WARN" "Gate retry $RETRIES/3 on Phase $phase"
                     SUBSTEP="IMPLEMENT"
                 fi
                 save_state
@@ -299,6 +361,11 @@ When done: echo 'TEST: COMPLETE <ms/step>' > $STATUS_FILE"
 
     cd "$worktree"
 
+    # Append inject if present
+    if [ -n "${INJECT_EXTRA:-}" ]; then
+        prompt+="$INJECT_EXTRA"
+    fi
+
     # Run agent with timeout
     local timeout=10800  # 3 hours
     if [ "$substep" = "REFERENCE" ] || [ "$substep" = "RESEARCH" ] || [ "$substep" = "PLAN" ]; then
@@ -345,21 +412,36 @@ When done: echo 'TEST: COMPLETE <ms/step>' > $STATUS_FILE"
 
 # --- Main Loop ---
 log "=== Phase Runner starting (Phase $PHASE, Substep $SUBSTEP) ==="
+gossip "ONLINE — Phase $PHASE, Substep $SUBSTEP"
 git tag "phase${PHASE}-start" HEAD 2>/dev/null || true
+start_heartbeat_loop
 
 while [ "$PHASE" -le 5 ]; do
     # Check pause
     if [ -f "$PAUSE_FILE" ]; then
         log "PAUSED — remove $PAUSE_FILE to continue"
         echo "PAUSED" > "$STATUS_FILE"
+        gossip "PAUSED — waiting for operator"
         while [ -f "$PAUSE_FILE" ]; do sleep 5; done
         log "RESUMED"
+        gossip "RESUMED"
     fi
 
-    log "--- Phase $PHASE, Substep $SUBSTEP ---"
+    # Check inject (applies to next agent session)
+    INJECT_EXTRA=""
+    local inject=$(check_inject)
+    if [ -n "$inject" ]; then
+        INJECT_EXTRA="
+
+ADDITIONAL INSTRUCTIONS FROM OPERATOR:
+$inject"
+    fi
+
+    log "--- Phase $PHASE, Substep $SUBSTEP (session $SESSIONS, retry $RETRIES) ---"
+    gossip "Phase $PHASE, Substep $SUBSTEP starting"
+    heartbeat
 
     if [ "$SUBSTEP" = "DONE" ]; then
-        log "Phase $PHASE substeps complete, this shouldn't happen"
         PHASE=$((PHASE + 1))
         SUBSTEP="REFERENCE"
         save_state
@@ -368,7 +450,17 @@ while [ "$PHASE" -le 5 ]; do
 
     build_prompt "$PHASE" "$SUBSTEP"
 
+    # Check if agent stalled (no status update for 20+ minutes)
+    if [ -f "$STATUS_FILE" ]; then
+        local status_age=$(( $(date +%s) - $(stat -f%m "$STATUS_FILE" 2>/dev/null || echo "0") ))
+        if [ "$status_age" -gt 1200 ] && [ "$SUBSTEP" != "GATE" ]; then
+            alert "WARN" "Agent status unchanged for $((status_age/60))min — may be stuck"
+        fi
+    fi
+
     sleep 5
 done
 
+stop_heartbeat_loop
+gossip "OFFLINE — all phases complete"
 log "=== All phases complete ==="
