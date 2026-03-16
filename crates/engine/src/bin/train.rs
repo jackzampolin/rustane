@@ -185,7 +185,7 @@ fn main() {
     // Compile kernels
     println!("\nCompiling 10 ANE kernels...");
     let t0 = Instant::now();
-    let kernels = CompiledKernels::compile(&cfg);
+    let mut kernels = CompiledKernels::compile(&cfg);
     println!("  compiled in {:.1}s", t0.elapsed().as_secs_f32());
 
     // Init model + Metal Adam optimizer
@@ -195,6 +195,11 @@ fn main() {
     let mut opt = ModelOptState::zeros(&cfg);
     let mut fwd_ws = ModelForwardWorkspace::new(&cfg);
     let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
+
+    // Initial conv1x1 ffnFused compilation (weights baked in, recompiled each step)
+    let t0 = Instant::now();
+    kernels.recompile_ffn_conv1x1(&cfg, &weights.layers);
+    println!("  conv1x1 ffnFused compiled in {:.1}ms", t0.elapsed().as_secs_f32() * 1000.0);
 
     let mut tc = TrainConfig::default();
     tc.total_steps = args.total_steps;
@@ -249,6 +254,11 @@ fn main() {
         let combined_scale = if gnorm > tc.grad_clip { tc.grad_clip / raw_norm } else { gsc };
         let lr = full_model::learning_rate(step, &tc);
         full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, combined_scale);
+
+        // Recompile conv1x1 ffnFused with updated weights
+        if kernels.has_ffn_conv1x1() {
+            kernels.recompile_ffn_conv1x1(&cfg, &weights.layers);
+        }
 
         let avg_loss = total_loss / tc.accum_steps as f32;
         let step_time = step_t0.elapsed().as_secs_f32();

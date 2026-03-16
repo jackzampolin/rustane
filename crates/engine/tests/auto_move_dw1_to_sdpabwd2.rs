@@ -48,7 +48,7 @@ fn move_dw1_backward_matches_reference() {
     // Forward to get cache
     let mut cache = ForwardCache::new(&cfg);
     let mut x_next = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
+    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next, 0);
 
     let dy: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.003) - 0.5) * 0.01).collect();
 
@@ -91,7 +91,7 @@ fn move_dw1_idempotent() {
 
     let mut cache = ForwardCache::new(&cfg);
     let mut x_next = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
+    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next, 0);
 
     let dy: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.003) - 0.5) * 0.01).collect();
 
@@ -128,7 +128,7 @@ fn move_dw1_accumulation() {
 
     let mut cache = ForwardCache::new(&cfg);
     let mut x_next = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
+    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next, 0);
 
     let dy: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.003) - 0.5) * 0.01).collect();
 

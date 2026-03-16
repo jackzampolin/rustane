@@ -207,9 +207,9 @@ pub fn forward_ws(
     for l in 0..cfg.nlayers {
         if l > 0 {
             let (prev_caches, curr_caches) = ws.caches.split_at_mut(l);
-            layer::forward_into_pipelined(cfg, kernels, &weights.layers[l], &ws.x_buf, &mut curr_caches[0], &mut ws.x_next_buf, Some(&mut prev_caches[l - 1]));
+            layer::forward_into_pipelined(cfg, kernels, &weights.layers[l], &ws.x_buf, &mut curr_caches[0], &mut ws.x_next_buf, Some(&mut prev_caches[l - 1]), l);
         } else {
-            layer::forward_into_pipelined(cfg, kernels, &weights.layers[0], &ws.x_buf, &mut ws.caches[0], &mut ws.x_next_buf, None);
+            layer::forward_into_pipelined(cfg, kernels, &weights.layers[0], &ws.x_buf, &mut ws.caches[0], &mut ws.x_next_buf, None, 0);
         }
         std::mem::swap(&mut ws.x_buf, &mut ws.x_next_buf);
     }
@@ -361,7 +361,7 @@ pub fn forward(
     // 2. Forward through NL layers
     let mut caches = Vec::with_capacity(cfg.nlayers);
     for l in 0..cfg.nlayers {
-        let (x_next, cache) = layer::forward(cfg, kernels, &weights.layers[l], &x);
+        let (x_next, cache) = layer::forward(cfg, kernels, &weights.layers[l], &x, l);
         caches.push(cache);
         x = x_next;
     }
@@ -645,7 +645,7 @@ fn random_vec(n: usize, scale: f32) -> Vec<f32> {
 /// Returns average loss across the accumulation microbatches.
 pub fn train_step(
     cfg: &ModelConfig,
-    kernels: &CompiledKernels,
+    kernels: &mut CompiledKernels,
     weights: &mut ModelWeights,
     grads: &mut ModelGrads,
     opt: &mut ModelOptState,
@@ -695,6 +695,12 @@ pub fn train_step(
     // Eliminates separate CPU sscal pass over ~168MB
     update_weights(cfg, weights, grads, opt, step + 1, lr, tc, metal_adam, combined_scale);
 
+    // Recompile conv1x1 ffnFused with updated weights (parallel across layers).
+    // ~40ms total (6 layers ÷ 6 threads). Must happen before next step's forward pass.
+    if kernels.has_ffn_conv1x1() {
+        kernels.recompile_ffn_conv1x1(cfg, &weights.layers);
+    }
+
     total_loss / tc.accum_steps as f32
 }
 
@@ -719,7 +725,7 @@ pub fn forward_losses(
 
     // Layers
     for l in 0..cfg.nlayers {
-        let (x_next, _) = layer::forward(cfg, kernels, &weights.layers[l], &x);
+        let (x_next, _) = layer::forward(cfg, kernels, &weights.layers[l], &x, l);
         x = x_next;
     }
 

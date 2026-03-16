@@ -32,11 +32,11 @@ fn forward_deterministic() {
     // Run forward twice with same input
     let mut cache1 = ForwardCache::new(&cfg);
     let mut x_next1 = vec![0.0f32; dim * seq];
-    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache1, &mut x_next1);
+    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache1, &mut x_next1, 0);
 
     let mut cache2 = ForwardCache::new(&cfg);
     let mut x_next2 = vec![0.0f32; dim * seq];
-    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache2, &mut x_next2);
+    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache2, &mut x_next2, 0);
 
     // Must be bit-exact (same staging, same ANE, same math)
     let max_diff: f32 = x_next1.iter().zip(x_next2.iter())
@@ -66,12 +66,12 @@ fn forward_into_matches_forward() {
     let x: Vec<f32> = (0..dim * seq).map(|i| ((i * 31 + 7) % 1000) as f32 * 0.001 - 0.5).collect();
 
     // Allocating path (reference)
-    let (x_next_ref, _cache_ref) = layer::forward(&cfg, &kernels, &weights, &x);
+    let (x_next_ref, _cache_ref) = layer::forward(&cfg, &kernels, &weights, &x, 0);
 
     // Workspace path (under test)
     let mut cache = ForwardCache::new(&cfg);
     let mut x_next = vec![0.0f32; dim * seq];
-    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
+    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next, 0);
 
     // Should match within ANE fp16 round-trip tolerance
     let max_diff: f32 = x_next.iter().zip(x_next_ref.iter())
@@ -104,15 +104,15 @@ fn back_to_back_with_different_weights() {
     let mut x_next = vec![0.0f32; dim * seq];
 
     // Run with weights_a
-    layer::forward_into(&cfg, &kernels, &weights_a, &x, &mut cache, &mut x_next);
+    layer::forward_into(&cfg, &kernels, &weights_a, &x, &mut cache, &mut x_next, 0);
     let x_next_a = x_next.clone();
 
     // Run with weights_b (different weights, same IOSurface buffers)
-    layer::forward_into(&cfg, &kernels, &weights_b, &x, &mut cache, &mut x_next);
+    layer::forward_into(&cfg, &kernels, &weights_b, &x, &mut cache, &mut x_next, 0);
     let x_next_b = x_next.clone();
 
     // Run with weights_a again — must match first run
-    layer::forward_into(&cfg, &kernels, &weights_a, &x, &mut cache, &mut x_next);
+    layer::forward_into(&cfg, &kernels, &weights_a, &x, &mut cache, &mut x_next, 0);
     let x_next_a2 = x_next.clone();
 
     // Verify weights_a results match across both runs

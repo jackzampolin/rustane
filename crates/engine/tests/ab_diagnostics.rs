@@ -115,7 +115,7 @@ fn ab_diagnose_bottlenecks() {
     let mut bwd_ws = BackwardWorkspace::new(&cfg);
 
     // Warmup
-    let (x_next, cache) = layer::forward(&cfg, &kernels, &layer_w, &x);
+    let (x_next, cache) = layer::forward(&cfg, &kernels, &layer_w, &x, 0);
     layer_g.zero_out();
     let _ = layer::backward(&cfg, &kernels, &layer_w, &cache, &x_next, &mut layer_g, &mut bwd_ws);
 
@@ -124,7 +124,7 @@ fn ab_diagnose_bottlenecks() {
     let mut bwd_1 = 0.0f32;
     for _ in 0..n_runs {
         let t = Instant::now();
-        let (x_next, cache) = layer::forward(&cfg, &kernels, &layer_w, &x);
+        let (x_next, cache) = layer::forward(&cfg, &kernels, &layer_w, &x, 0);
         fwd_1 += t.elapsed().as_secs_f32() * 1000.0;
 
         layer_g.zero_out();

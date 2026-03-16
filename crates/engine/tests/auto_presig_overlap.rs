@@ -51,7 +51,7 @@ fn presig_overlap_backward_matches_reference() {
     // Forward to get cache (needed for both backward paths)
     let mut cache = ForwardCache::new(&cfg);
     let mut x_next = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
+    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next, 0);
 
     // Gradient signal from next layer (deterministic)
     let dy: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.003) - 0.5) * 0.01).collect();
@@ -93,7 +93,7 @@ fn presig_overlap_back_to_back_idempotent() {
     let x: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.002) - 0.5) * 0.1).collect();
     let mut cache = ForwardCache::new(&cfg);
     let mut x_next = vec![0.0f32; n_in];
-    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
+    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next, 0);
     let dy: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.005) - 0.5) * 0.01).collect();
 
     let mut grads1 = LayerGrads::zeros(&cfg);

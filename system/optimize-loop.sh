@@ -31,12 +31,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # --- Config ---
-TARGET_MS=89
-MAX_ITERS=20
+TARGET_MS=150
+MAX_ITERS=30
 COOLDOWN=10
 MODEL="claude-opus-4-6"
 AGENT_ID="alpha"
-BASE_BRANCH="auto-max"
+BASE_BRANCH="feature/1024-opt"
 DRY_RUN=false
 SHOW_STATUS=false
 ITER_TIMEOUT_MIN=35   # minutes per iteration (effort high needs ~20min thinking + time to code/test)
@@ -231,54 +231,53 @@ log "Starting ms/step: ${STARTING_MS:-unknown}"
 read -r -d '' PROMPT << 'PROMPT_END' || true
 You are an optimization agent for the rustane training engine on Apple M4 Max.
 Your agent ID is: %%AGENT_ID%%
-Goal: reduce ms/step to sub-89ms. Maderix Obj-C achieves 89ms.
-Current state: ~125ms/step single-step (with accum=10: ~960ms/step estimated).
-ANY reduction in ms/step is valuable and worth committing — even 2-3ms wins compound.
+MODEL: gpt_1024 (8 layers, dim=1024, hidden=2816, seq=512, vocab=8192, 130M params)
+Goal: reduce ms/step from 210ms toward 150ms. ANY reduction is valuable.
+
+CURRENT PROFILE (per layer, 18.3ms):
+  Forward 5.8ms: ANE sdpaFwd 2.0ms, woFwd 0.3ms, ffnFused 1.2ms, staging 2.0ms, CPU 0.3ms
+  Backward 12.6ms: ANE+dW 8.4ms, staging 2.7ms, CPU 1.4ms (SiLU 0.75ms, RMSNorm 0.3ms)
+  Adam: 17ms (3-thread CPU fused), Grad norm: 3.2ms (2-thread)
+
+The codebase already has 768-era optimizations (async overlap, dW rebalancing, CPU Adam,
+parallel threading) but they were TUNED for 768 dim. At 1024, timings shift:
+  - dW sgemm calls are larger (~1ms each vs 0.3ms at 768) — may not hide in overlap
+  - SiLU backward is 0.75ms/layer — might be above threading threshold now
+  - Adam is 17ms — could benefit from 4+ threads instead of 3
+  - ANE kernels take longer — overlap ratios change
 
 TIME LIMIT: You have %%TIMEOUT%%min for this iteration. Focus on ONE experiment.
-If implementation is taking too long, simplify or log as PLANNED and exit.
 
-STATUS FILE: Update /tmp/rustane-status-%%AGENT_ID%% at each phase so the operator can monitor:
-  echo "READING" > /tmp/rustane-status-%%AGENT_ID%%              # reading context files
-  echo "CLAIMED: <name>" > /tmp/rustane-status-%%AGENT_ID%%      # picked experiment
-  echo "CODING" > /tmp/rustane-status-%%AGENT_ID%%               # writing implementation
-  echo "CODING: <file>" > /tmp/rustane-status-%%AGENT_ID%%       # writing specific file
-  echo "TESTING" > /tmp/rustane-status-%%AGENT_ID%%              # running cargo test
-  echo "TEST_COMPLETE" > /tmp/rustane-status-%%AGENT_ID%%        # tests passed/failed
-  echo "BENCHMARKING" > /tmp/rustane-status-%%AGENT_ID%%         # running benchmarks
-  echo "LOGGING" > /tmp/rustane-status-%%AGENT_ID%%              # writing experiments.tsv
-  echo "DONE: <verdict> <ms>" > /tmp/rustane-status-%%AGENT_ID%% # finished
-Do this BEFORE each step — it costs nothing and lets the operator see progress.
+STATUS FILE: Update /tmp/rustane-status-%%AGENT_ID%% at each phase:
+  echo "READING" > /tmp/rustane-status-%%AGENT_ID%%
+  echo "CLAIMED: <name>" > /tmp/rustane-status-%%AGENT_ID%%
+  echo "CODING: <file>" > /tmp/rustane-status-%%AGENT_ID%%
+  echo "TESTING" > /tmp/rustane-status-%%AGENT_ID%%
+  echo "BENCHMARKING" > /tmp/rustane-status-%%AGENT_ID%%
+  echo "DONE: <verdict> <ms>" > /tmp/rustane-status-%%AGENT_ID%%
 
-STEP 1 — READ CONTEXT (do this first, do not skip):
-  - dev/CURRENT.md (current project state, what works, what's broken)
-  - system/experiments.tsv (every experiment tried, results, verdicts)
-  - dev/sessions/2026-03-12_perf-optimization.md (what worked, what failed, why)
-  - dev/METHODOLOGY.md (rules: one variable, verify correctness, log everything)
-  - results/rust_vs_objc_deep_comparison.md (root cause analysis of the perf gap)
-  - CREDITS.md (reference implementations — especially Espresso for fused kernels,
-    maderix/ANE for async dispatch, ane-infer for Metal decode)
-
-STEP 1.5 — READ GOSSIP FILE:
-  Read /tmp/rustane-gossip.md to see what other agents are working on or have tried.
-  This file is shared between parallel optimization agents. Use it to:
-  - Avoid picking an experiment another agent already claimed
-  - Learn from other agents' findings (what worked, what's blocked, insights)
-  - See if another agent found a blocker that affects your planned experiment
+STEP 1 — READ CONTEXT:
+  - AGENTS.md (hardware facts, dead ends — READ THIS FIRST)
+  - system/experiments.tsv (what's been tried)
+  - /tmp/rustane-gossip.md (other agent activity)
+  - crates/engine/src/layer.rs (the hot path — overlap scopes, dW placement)
+  - crates/engine/src/model.rs (gpt_1024 config)
 
 STEP 2 — PICK ONE EXPERIMENT:
-Read system/experiments.tsv carefully. Choose the single highest-impact thing to try next.
-Priority order (remaining opportunities from root cause analysis):
-  1. Fused multi-layer ANE kernels — 2 layers per program, fewer dispatches (PLANNED, biggest remaining win)
-  2. INT4 quantized classifier — packed nibble matvec, skip full logit buffer (PLANNED)
-  3. Vectorize SiLU derivative — currently scalar loop ~0.8ms/layer, SIMD should be ~0.1ms
-  4. Reduce IOSurface staging overhead — channel-interleaved layout eliminates per-channel copy loops
-  5. Metal compute for backward CPU ops — move dW accumulation or RoPE to GPU
-Already DONE (do not re-attempt): async ANE dispatch, pre-stage weights, allocation churn,
-  softcap removal, parallel pre-staging, workspace path optimization.
-Do NOT re-run experiments already marked PASS, IMPROVED, or REVERTED in the TSV.
-Do NOT duplicate work another agent claimed in the gossip file.
-If all high-priority items are blocked or done, pick the next logical thing from profiling data.
+Priority order for 1024 fine-tuning:
+  1. Re-profile overlap windows — which scopes are now CPU-bound vs ANE-bound at 1024?
+  2. Re-rebalance dW across overlap scopes — dW sgemm at ~1ms may overflow current windows
+  3. More Adam threads — 17ms with 3 threads, try 4 or 6
+  4. More grad_norm threads — 3.2ms with 2 threads, try 3-4
+  5. Parallel SiLU backward — 0.75ms/layer, borderline for threading
+  6. Deferred readback tuning — different overlap ratios at 1024
+  7. Staging optimization — bigger buffers, different bottleneck points
+Do NOT attempt: kernel fusion (proven dead), conv1x1 recompile (proven dead at this scale).
+Do NOT re-run experiments already in the TSV.
+
+IMPORTANT: Use bench_step_time with the gpt_1024 test:
+  cargo test -p engine --test bench_step_time --release -- bench_training_step_1024 --ignored --nocapture
+NOT the default bench_training_step (that runs 768).
 
 After picking, write your claim to the gossip file:
   echo "[$(date '+%H:%M:%S')] [%%AGENT_ID%%] CLAIMED: <experiment_name> — <one-line hypothesis>" >> /tmp/rustane-gossip.md

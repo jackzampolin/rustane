@@ -73,7 +73,7 @@ pub fn train_step(
     let n = dim * seq;
 
     // Forward
-    let (x_next, cache) = layer::forward(cfg, kernels, weights, x);
+    let (x_next, cache) = layer::forward(cfg, kernels, weights, x, 0);
 
     // MSE loss = mean(x_next²)
     let loss: f32 = x_next.iter().map(|v| v * v).sum::<f32>() / n as f32;

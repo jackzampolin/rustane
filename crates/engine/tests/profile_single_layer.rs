@@ -21,7 +21,7 @@ fn profile_layer_ops() {
     // Warmup
     let mut bwd_ws = layer::BackwardWorkspace::new(&cfg);
     {
-        let (x_next, cache) = layer::forward(&cfg, &kernels, &weights, &x);
+        let (x_next, cache) = layer::forward(&cfg, &kernels, &weights, &x, 0);
         let _ = layer::backward(&cfg, &kernels, &weights, &cache, &x_next, &mut grads, &mut bwd_ws);
     }
 

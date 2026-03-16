@@ -74,7 +74,7 @@ fn profile_full_step_breakdown() {
     let t = Instant::now();
     let mut caches = Vec::with_capacity(cfg.nlayers);
     for l in 0..cfg.nlayers {
-        let (x_next, cache) = engine::layer::forward(&cfg, &kernels, &weights.layers[l], &x);
+        let (x_next, cache) = engine::layer::forward(&cfg, &kernels, &weights.layers[l], &x, l);
         caches.push(cache);
         x = x_next;
     }
