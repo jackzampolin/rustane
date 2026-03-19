@@ -36,11 +36,26 @@ The engine trains transformer models at 3-5W power draw, leaving the GPU complet
 
 No ANE compilation ceiling found. The limit is RAM, not the chip.
 
+### M5 Max Forward-Only Results
+
+Community results from [Anemll](https://github.com/Anemll) testing on M5 Max 128GB:
+
+| Scale | M4 Max | M5 Max | Speedup |
+|-------|--------|--------|---------|
+| 5B | 2,064ms | 1,910ms | 8% |
+| 7B | 3,132ms | 2,878ms | 8% |
+| 10B | 4,696ms | 4,329ms | 8% |
+| 13B | 21,962ms | 20,270ms | 8% |
+| 15B | 26,740ms | 24,303ms | 9% |
+| 20B | 40,933ms | 32,380ms | **21%** |
+
+Steady 8% faster at 5B-15B, 21% at 20B. The dim=5120 efficiency cliff is present on both chips.
+
 ### Key Findings
 
 - **Architecture crossover at 3B**: wide+shallow wins below (fewer ANE dispatches), deep+narrow wins above (smaller matmuls more efficient)
 - **Efficiency cliff at dim=5120**: forward time jumps 4.7x per layer. Keep dim at or below 4096 for ANE.
-- **Practical training ceiling**: ~5B on 128GB. An M3/M4 Ultra with 512GB could reach ~20B.
+- **Practical training ceiling**: ~5B on 128GB. An M3 Ultra with 512GB could reach ~20B.
 
 ## Architecture
 
@@ -93,13 +108,19 @@ cargo run -p engine --release --bin train -- \
 
 ## Hardware Requirements
 
+Any Apple Silicon Mac with 18GB+ RAM. The ANE is the same 16-core design across M1-M4. Only RAM differs.
+
+Tested on M4 Max 128GB. Other configs are estimates based on RAM scaling.
+
 | Hardware | Memory | Training Ceiling | Forward Ceiling |
 |----------|--------|-----------------|-----------------|
-| M4 Max 128GB | 128 GB | **~5B** (85GB) | **~30B** (130GB) |
-| M4 Max 64GB | 64 GB | ~3B | ~15B |
-| M4 Pro 48GB | 48 GB | ~1.5B | ~10B |
-| M4 Pro 24GB | 24 GB | ~600M | ~5B |
-| M3/M4 Ultra 512GB | 512 GB | ~20B | ~100B+ |
+| M1/M2/M3 Pro 18GB | 18 GB | ~300M | ~3B |
+| M1/M2/M3 Pro 36GB | 36 GB | ~1B | ~7B |
+| M1/M2/M3/M4 Max 64GB | 64 GB | ~3B | ~15B |
+| M3/M4 Max 96GB | 96 GB | ~5B | ~20B |
+| **M3/M4 Max 128GB** | **128 GB** | **~5B** (tested) | **~30B** (tested) |
+| M3 Ultra 192GB | 192 GB | ~10B | ~40B+ |
+| M3 Ultra 512GB | 512 GB | ~20B | ~100B+ |
 
 ## ANE Gotchas
 
