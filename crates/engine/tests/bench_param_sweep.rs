@@ -328,6 +328,92 @@ fn sweep_1_5b_e() {
 }
 
 
+// ── 3B variants (~55GB RAM, fits 128GB) ────────────────────────────────
+
+#[test]
+#[ignore]
+fn sweep_3b_a() {
+    let r = run_sweep(&custom_config(2560, 6912, 20, 40, 512), "3b-A");
+    assert!(r.all_finite, "NaN/Inf detected");
+    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
+}
+
+#[test]
+#[ignore]
+fn sweep_3b_b() {
+    let r = run_sweep(&custom_config(2304, 6144, 18, 48, 512), "3b-B");
+    assert!(r.all_finite, "NaN/Inf detected");
+    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
+}
+
+#[test]
+#[ignore]
+fn sweep_3b_c() {
+    let r = run_sweep(&custom_config(3072, 8192, 24, 28, 512), "3b-C");
+    assert!(r.all_finite, "NaN/Inf detected");
+    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
+}
+
+#[test]
+#[ignore]
+fn sweep_3b_d() {
+    let r = run_sweep(&custom_config(2560, 10240, 20, 28, 512), "3b-D");
+    assert!(r.all_finite, "NaN/Inf detected");
+    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
+}
+
+#[test]
+#[ignore]
+fn sweep_3b_e() {
+    let r = run_sweep(&custom_config(2560, 6912, 20, 40, 256), "3b-E");
+    assert!(r.all_finite, "NaN/Inf detected");
+    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
+}
+
+
+// ── 5B variants (~85GB RAM, tight on 128GB) ────────────────────────────
+
+#[test]
+#[ignore]
+fn sweep_5b_a() {
+    let r = run_sweep(&custom_config(3072, 8192, 24, 44, 512), "5b-A");
+    assert!(r.all_finite, "NaN/Inf detected");
+    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
+}
+
+#[test]
+#[ignore]
+fn sweep_5b_b() {
+    let r = run_sweep(&custom_config(2560, 6912, 20, 60, 512), "5b-B");
+    assert!(r.all_finite, "NaN/Inf detected");
+    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
+}
+
+#[test]
+#[ignore]
+fn sweep_5b_c() {
+    let r = run_sweep(&custom_config(3584, 9600, 28, 32, 512), "5b-C");
+    assert!(r.all_finite, "NaN/Inf detected");
+    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
+}
+
+#[test]
+#[ignore]
+fn sweep_5b_d() {
+    let r = run_sweep(&custom_config(3072, 12288, 24, 32, 512), "5b-D");
+    assert!(r.all_finite, "NaN/Inf detected");
+    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
+}
+
+#[test]
+#[ignore]
+fn sweep_5b_e() {
+    let r = run_sweep(&custom_config(3072, 8192, 24, 44, 256), "5b-E");
+    assert!(r.all_finite, "NaN/Inf detected");
+    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
+}
+
+
 // ── Grouped sweeps ─────────────────────────────────────────────────────
 
 #[test]
@@ -375,6 +461,42 @@ fn sweep_all_1_5b() {
         (custom_config(2560, 6912, 20, 24, 512), "1.5b-C"),
         (custom_config(2304, 9216, 18, 22, 512), "1.5b-D"),
         (custom_config(2304, 6144, 18, 32, 256), "1.5b-E"),
+    ];
+    let results: Vec<SweepResult> = configs.iter().map(|(cfg, name)| run_sweep(cfg, name)).collect();
+    print_results_table(&results);
+    for r in &results {
+        assert!(r.all_finite, "{}: NaN/Inf detected", r.name);
+        assert!(r.loss_delta < 0.0, "{}: loss did not decrease: delta={}", r.name, r.loss_delta);
+    }
+}
+
+#[test]
+#[ignore]
+fn sweep_all_3b() {
+    let configs = vec![
+        (custom_config(2560, 6912, 20, 40, 512), "3b-A"),
+        (custom_config(2304, 6144, 18, 48, 512), "3b-B"),
+        (custom_config(3072, 8192, 24, 28, 512), "3b-C"),
+        (custom_config(2560, 10240, 20, 28, 512), "3b-D"),
+        (custom_config(2560, 6912, 20, 40, 256), "3b-E"),
+    ];
+    let results: Vec<SweepResult> = configs.iter().map(|(cfg, name)| run_sweep(cfg, name)).collect();
+    print_results_table(&results);
+    for r in &results {
+        assert!(r.all_finite, "{}: NaN/Inf detected", r.name);
+        assert!(r.loss_delta < 0.0, "{}: loss did not decrease: delta={}", r.name, r.loss_delta);
+    }
+}
+
+#[test]
+#[ignore]
+fn sweep_all_5b() {
+    let configs = vec![
+        (custom_config(3072, 8192, 24, 44, 512), "5b-A"),
+        (custom_config(2560, 6912, 20, 60, 512), "5b-B"),
+        (custom_config(3584, 9600, 28, 32, 512), "5b-C"),
+        (custom_config(3072, 12288, 24, 32, 512), "5b-D"),
+        (custom_config(3072, 8192, 24, 44, 256), "5b-E"),
     ];
     let results: Vec<SweepResult> = configs.iter().map(|(cfg, name)| run_sweep(cfg, name)).collect();
     print_results_table(&results);
