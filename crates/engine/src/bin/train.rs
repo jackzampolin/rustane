@@ -255,7 +255,9 @@ fn main() {
     // On M3/M4 Ultra (dual-die), ANE eval calls accumulate internal firmware
     // state that degrades throughput after ~100K dispatches. Periodic recompile
     // resets this state. Cost: ~1s every N steps. Set to 0 to disable.
-    let ane_refresh_interval: u32 = 150;
+    // Tuned for M3 Ultra 600M: degradation starts at ~43 steps (~28K dispatches).
+    // Refresh at 40 keeps step times at 1.0s with ~2.5% overhead from recompile.
+    let ane_refresh_interval: u32 = 40;
 
     // Init model + Metal Adam optimizer
     let metal_adam = MetalAdam::new().expect("Metal GPU required for training");
