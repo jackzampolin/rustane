@@ -414,6 +414,29 @@ fn sweep_5b_e() {
 }
 
 
+// ── 7B+ full training probes (~112GB RAM for 7B) ───────────────────────
+
+#[test]
+#[ignore]
+fn sweep_7b() {
+    // Llama-2-7B shape: dim=4096, hidden=11008, 32 heads, 32 layers
+    // ~6.5B params, ~112GB training RAM — tight on 128GB
+    let r = run_sweep(&custom_config(4096, 11008, 32, 32, 512), "7b");
+    assert!(r.all_finite, "NaN/Inf detected");
+    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
+}
+
+#[test]
+#[ignore]
+fn sweep_10b() {
+    // 10B: dim=4096, hidden=11008, 48 layers
+    // ~9.8B params, ~168GB training RAM — will use swap on 128GB
+    let r = run_sweep(&custom_config(4096, 11008, 32, 48, 512), "10b");
+    assert!(r.all_finite, "NaN/Inf detected");
+    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
+}
+
+
 // ── Grouped sweeps ─────────────────────────────────────────────────────
 
 #[test]
