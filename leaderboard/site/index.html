@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rustane bench — Apple Neural Engine Training Leaderboard</title>
+  <meta name="description" content="Community benchmark leaderboard for rustane — the first training-capable Rust engine for Apple Neural Engine.">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg: #0c0c14;
+      --card: #13131f;
+      --border: #1e1e2e;
+      --ane: #79c0ff;
+      --green: #56d364;
+      --accent: #e3b341;
+      --red: #f85149;
+      --white: #c9d1d9;
+      --dim: #8b949e;
+      --dimmer: #484f58;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--white);
+      font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 40px 24px;
+    }
+
+    /* ── Header ─────────────────────────────────────── */
+
+    header {
+      text-align: center;
+      margin-bottom: 48px;
+    }
+
+    h1 {
+      font-size: 32px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      margin-bottom: 8px;
+    }
+
+    h1 .ane { color: var(--ane); }
+
+    .subtitle {
+      color: var(--dim);
+      font-size: 14px;
+      margin-bottom: 24px;
+    }
+
+    .how-to {
+      display: inline-block;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 20px;
+      font-size: 13px;
+      color: var(--dim);
+      text-align: left;
+    }
+
+    .how-to code {
+      color: var(--green);
+      background: rgba(86, 211, 100, 0.1);
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+
+    /* ── Filters ────────────────────────────────────── */
+
+    .filters {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .filter-label {
+      color: var(--dim);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+    }
+
+    select {
+      background: var(--card);
+      color: var(--white);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-family: inherit;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    select:focus { outline: 1px solid var(--ane); }
+
+    /* ── Section ────────────────────────────────────── */
+
+    .section {
+      margin-bottom: 48px;
+    }
+
+    .section h2 {
+      font-size: 18px;
+      font-weight: 500;
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .section h2 .badge {
+      font-size: 11px;
+      background: rgba(121, 192, 255, 0.12);
+      color: var(--ane);
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-weight: 400;
+    }
+
+    /* ── Table ──────────────────────────────────────── */
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--card);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    thead th {
+      text-align: left;
+      padding: 10px 14px;
+      font-weight: 500;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--dim);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    thead th:hover { color: var(--white); }
+    thead th.sorted { color: var(--ane); }
+    thead th .arrow { font-size: 10px; margin-left: 4px; }
+
+    tbody tr {
+      border-bottom: 1px solid rgba(30, 30, 46, 0.5);
+      transition: background 0.15s;
+    }
+
+    tbody tr:hover { background: rgba(121, 192, 255, 0.04); }
+    tbody tr:last-child { border-bottom: none; }
+
+    td {
+      padding: 10px 14px;
+      white-space: nowrap;
+    }
+
+    .rank {
+      color: var(--dimmer);
+      font-weight: 500;
+      width: 40px;
+    }
+
+    .rank-1 { color: var(--accent); }
+    .rank-2 { color: var(--white); }
+    .rank-3 { color: #cd7f32; }
+
+    .name-cell {
+      font-weight: 500;
+      color: var(--white);
+    }
+
+    .x-handle {
+      color: var(--dim);
+      font-size: 12px;
+    }
+
+    .chip { color: var(--ane); }
+    .metric-primary { color: var(--green); font-weight: 500; }
+    .metric-secondary { color: var(--dim); }
+
+    .verified {
+      color: var(--green);
+      font-size: 12px;
+    }
+
+    .unverified {
+      color: var(--dimmer);
+      font-size: 12px;
+    }
+
+    .share-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--dim);
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .share-btn:hover {
+      border-color: var(--ane);
+      color: var(--ane);
+    }
+
+    /* ── Detail row ─────────────────────────────────── */
+
+    .detail-row td {
+      padding: 0;
+    }
+
+    .detail-content {
+      padding: 16px 14px;
+      background: rgba(19, 19, 31, 0.8);
+      font-size: 12px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+    }
+
+    .detail-group label {
+      display: block;
+      color: var(--dimmer);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      margin-bottom: 4px;
+    }
+
+    .detail-group .val {
+      color: var(--white);
+    }
+
+    /* ── Empty state ────────────────────────────────── */
+
+    .empty {
+      text-align: center;
+      padding: 48px 24px;
+      color: var(--dim);
+    }
+
+    .empty .icon { font-size: 32px; margin-bottom: 12px; }
+
+    /* ── Loading ────────────────────────────────────── */
+
+    .loading {
+      text-align: center;
+      padding: 48px;
+      color: var(--dim);
+    }
+
+    .loading .spinner {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 2px solid var(--border);
+      border-top-color: var(--ane);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-bottom: 12px;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Footer ─────────────────────────────────────── */
+
+    footer {
+      text-align: center;
+      padding-top: 32px;
+      border-top: 1px solid var(--border);
+      color: var(--dimmer);
+      font-size: 12px;
+    }
+
+    footer a {
+      color: var(--dim);
+      text-decoration: none;
+    }
+
+    footer a:hover { color: var(--ane); }
+
+    /* ── Responsive ─────────────────────────────────── */
+
+    @media (max-width: 768px) {
+      .container { padding: 24px 16px; }
+      h1 { font-size: 24px; }
+      table { font-size: 12px; }
+      td, thead th { padding: 8px 10px; }
+      .how-to { font-size: 12px; padding: 10px 14px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>rustane <span class="ane">bench</span></h1>
+      <p class="subtitle">Apple Neural Engine training leaderboard — community benchmarks</p>
+      <div class="how-to">
+        <code>make sweep-600m</code> → <code>make submit</code> → appear here<br>
+        <span style="color: var(--dimmer)">Requires: rustane + Apple Silicon Mac + jq</span>
+      </div>
+    </header>
+
+    <div class="filters">
+      <span class="filter-label">Filter:</span>
+      <select id="chip-filter">
+        <option value="all">All Chips</option>
+      </select>
+      <select id="scale-filter">
+        <option value="all">All Scales</option>
+      </select>
+    </div>
+
+    <div class="section" id="training-section">
+      <h2>Training Validation <span class="badge">fwd + bwd + adam</span></h2>
+      <div class="table-wrap">
+        <div class="loading" id="training-loading">
+          <div class="spinner"></div>
+          <div>Loading results...</div>
+        </div>
+        <table id="training-table" style="display: none;">
+          <thead>
+            <tr>
+              <th class="sorted">#</th>
+              <th>Name</th>
+              <th>Chip</th>
+              <th>RAM</th>
+              <th>Scale</th>
+              <th data-sort="tok_per_s" class="sorted">tok/s ↓</th>
+              <th data-sort="ms_per_step">ms/step</th>
+              <th>Loss Δ</th>
+              <th>Verified</th>
+              <th>Date</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section" id="forward-section">
+      <h2>Forward Pass <span class="badge">inference only</span></h2>
+      <div class="table-wrap">
+        <div class="loading" id="forward-loading">
+          <div class="spinner"></div>
+          <div>Loading results...</div>
+        </div>
+        <table id="forward-table" style="display: none;">
+          <thead>
+            <tr>
+              <th class="sorted">#</th>
+              <th>Name</th>
+              <th>Chip</th>
+              <th>RAM</th>
+              <th>Scale</th>
+              <th data-sort="ms_per_step" class="sorted">ms ↑</th>
+              <th data-sort="tok_per_s">tok/s</th>
+              <th>Verified</th>
+              <th>Date</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <footer>
+      <p>
+        <a href="https://github.com/ncdrone/rustane">rustane</a> —
+        the first training-capable Rust engine for Apple Neural Engine
+      </p>
+    </footer>
+  </div>
+
+  <script>
+    const API = "https://api.bench.rustane.org";
+    let allData = {};
+
+    // ── Fetch data ────────────────────────────────────
+
+    async function loadLeaderboard() {
+      try {
+        const resp = await fetch(`${API}/api/results`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        allData = await resp.json();
+      } catch (err) {
+        console.error("Failed to load:", err);
+        allData = {};
+      }
+
+      populateFilters();
+      renderAll();
+    }
+
+    // ── Filters ───────────────────────────────────────
+
+    function populateFilters() {
+      const chips = new Set();
+      const scales = new Set();
+
+      for (const [bench, entries] of Object.entries(allData)) {
+        for (const e of entries) {
+          chips.add(e.chip);
+          scales.add(benchToScale(bench));
+        }
+      }
+
+      const chipSelect = document.getElementById("chip-filter");
+      for (const chip of [...chips].sort()) {
+        const opt = document.createElement("option");
+        opt.value = chip;
+        opt.textContent = chip;
+        chipSelect.appendChild(opt);
+      }
+
+      const scaleSelect = document.getElementById("scale-filter");
+      for (const scale of [...scales].sort()) {
+        const opt = document.createElement("option");
+        opt.value = scale;
+        opt.textContent = scale;
+        scaleSelect.appendChild(opt);
+      }
+    }
+
+    function benchToScale(bench) {
+      // sweep_600m_a → 600M, fwd_7b → 7B
+      const parts = bench.replace("sweep_", "").replace("fwd_", "");
+      const match = parts.match(/^(\d+_?\d*[bm])/i);
+      if (!match) return bench;
+      return match[1].replace("_", ".").toUpperCase();
+    }
+
+    function getFilters() {
+      return {
+        chip: document.getElementById("chip-filter").value,
+        scale: document.getElementById("scale-filter").value,
+      };
+    }
+
+    function matchesFilter(entry, bench) {
+      const f = getFilters();
+      if (f.chip !== "all" && entry.chip !== f.chip) return false;
+      if (f.scale !== "all" && benchToScale(bench) !== f.scale) return false;
+      return true;
+    }
+
+    // ── Rendering ─────────────────────────────────────
+
+    function renderAll() {
+      renderTraining();
+      renderForward();
+    }
+
+    function renderTraining() {
+      const entries = [];
+      for (const [bench, list] of Object.entries(allData)) {
+        if (!bench.startsWith("sweep_")) continue;
+        for (const e of list) {
+          if (matchesFilter(e, bench)) entries.push({ ...e, _bench: bench });
+        }
+      }
+      entries.sort((a, b) => b.tok_per_s - a.tok_per_s);
+
+      const loading = document.getElementById("training-loading");
+      const table = document.getElementById("training-table");
+      loading.style.display = "none";
+      table.style.display = entries.length ? "" : "none";
+
+      if (!entries.length) {
+        showEmpty("training-section", "No training results yet. Be the first!");
+        return;
+      }
+      clearEmpty("training-section");
+
+      const tbody = table.querySelector("tbody");
+      tbody.innerHTML = "";
+
+      entries.forEach((e, i) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="rank ${i < 3 ? "rank-" + (i + 1) : ""}">${i + 1}</td>
+          <td class="name-cell">${esc(e.name)}${e.x_handle ? ` <span class="x-handle">${esc(e.x_handle)}</span>` : ""}</td>
+          <td class="chip">${esc(e.chip)}</td>
+          <td>${e.ram_gb}GB</td>
+          <td>${benchToScale(e._bench)}</td>
+          <td class="metric-primary">${e.tok_per_s.toFixed(0)}</td>
+          <td class="metric-secondary">${e.ms_per_step.toFixed(0)}</td>
+          <td class="metric-secondary">${e.loss_delta.toFixed(4)}</td>
+          <td>${e.verified ? '<span class="verified">✓</span>' : '<span class="unverified">—</span>'}</td>
+          <td class="metric-secondary">${formatDate(e.submitted_at)}</td>
+          <td><button class="share-btn" onclick="shareX('${e.id}', '${esc(e._bench)}', '${esc(e.chip)}', ${e.ram_gb}, ${e.tok_per_s.toFixed(0)}, ${e.ms_per_step.toFixed(0)})">Share</button></td>
+        `;
+        tr.style.cursor = "pointer";
+        tr.addEventListener("click", (ev) => {
+          if (ev.target.tagName === "BUTTON") return;
+          toggleDetail(tr, e);
+        });
+        tbody.appendChild(tr);
+      });
+    }
+
+    function renderForward() {
+      const entries = [];
+      for (const [bench, list] of Object.entries(allData)) {
+        if (!bench.startsWith("fwd_")) continue;
+        for (const e of list) {
+          if (matchesFilter(e, bench)) entries.push({ ...e, _bench: bench });
+        }
+      }
+      entries.sort((a, b) => a.ms_per_step - b.ms_per_step);
+
+      const loading = document.getElementById("forward-loading");
+      const table = document.getElementById("forward-table");
+      loading.style.display = "none";
+      table.style.display = entries.length ? "" : "none";
+
+      if (!entries.length) {
+        showEmpty("forward-section", "No forward pass results yet.");
+        return;
+      }
+      clearEmpty("forward-section");
+
+      const tbody = table.querySelector("tbody");
+      tbody.innerHTML = "";
+
+      entries.forEach((e, i) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="rank ${i < 3 ? "rank-" + (i + 1) : ""}">${i + 1}</td>
+          <td class="name-cell">${esc(e.name)}${e.x_handle ? ` <span class="x-handle">${esc(e.x_handle)}</span>` : ""}</td>
+          <td class="chip">${esc(e.chip)}</td>
+          <td>${e.ram_gb}GB</td>
+          <td>${benchToScale(e._bench)}</td>
+          <td class="metric-primary">${e.ms_per_step.toFixed(0)}ms</td>
+          <td class="metric-secondary">${e.tok_per_s.toFixed(0)}</td>
+          <td>${e.verified ? '<span class="verified">✓</span>' : '<span class="unverified">—</span>'}</td>
+          <td class="metric-secondary">${formatDate(e.submitted_at)}</td>
+          <td><button class="share-btn" onclick="shareX('${e.id}', '${esc(e._bench)}', '${esc(e.chip)}', ${e.ram_gb}, ${e.tok_per_s.toFixed(0)}, ${e.ms_per_step.toFixed(0)})">Share</button></td>
+        `;
+        tr.style.cursor = "pointer";
+        tr.addEventListener("click", (ev) => {
+          if (ev.target.tagName === "BUTTON") return;
+          toggleDetail(tr, e);
+        });
+        tbody.appendChild(tr);
+      });
+    }
+
+    // ── Detail expansion ──────────────────────────────
+
+    function toggleDetail(tr, entry) {
+      const next = tr.nextElementSibling;
+      if (next && next.classList.contains("detail-row")) {
+        next.remove();
+        return;
+      }
+
+      const detail = document.createElement("tr");
+      detail.classList.add("detail-row");
+      const cols = tr.querySelectorAll("td").length;
+      detail.innerHTML = `
+        <td colspan="${cols}">
+          <div class="detail-content">
+            <div class="detail-group">
+              <label>Timing Breakdown</label>
+              <div class="val">
+                fwd: ${entry.ms_fwd ?? "—"}ms &nbsp;
+                bwd: ${entry.ms_bwd ?? "—"}ms &nbsp;
+                upd: ${entry.ms_upd ?? "—"}ms
+              </div>
+            </div>
+            <div class="detail-group">
+              <label>Model Config</label>
+              <div class="val">${entry.params_m?.toFixed(0) ?? "?"}M params</div>
+            </div>
+            <div class="detail-group">
+              <label>Git SHA</label>
+              <div class="val" style="font-family: monospace;">${esc(entry.git_sha || "—")}</div>
+            </div>
+            <div class="detail-group">
+              <label>Benchmark</label>
+              <div class="val">${esc(entry._bench || entry.benchmark || "—")}</div>
+            </div>
+          </div>
+        </td>
+      `;
+      tr.after(detail);
+    }
+
+    // ── Helpers ────────────────────────────────────────
+
+    function esc(s) {
+      if (!s) return "";
+      const d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    function formatDate(iso) {
+      if (!iso) return "—";
+      const d = new Date(iso);
+      return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    }
+
+    function shareX(id, bench, chip, ram, toks, ms) {
+      const text = `Just ran rustane ${bench} on ${chip} ${ram}GB\n\n${toks} tok/s | ${ms}ms/step\n\nhttps://bench.rustane.org/?id=${id}`;
+      window.open(
+        `https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}`,
+        "_blank"
+      );
+    }
+
+    function showEmpty(sectionId, msg) {
+      const section = document.getElementById(sectionId);
+      if (section.querySelector(".empty")) return;
+      const wrap = section.querySelector(".table-wrap");
+      const div = document.createElement("div");
+      div.className = "empty";
+      div.innerHTML = `<div class="icon">📊</div><div>${msg}</div>`;
+      wrap.appendChild(div);
+    }
+
+    function clearEmpty(sectionId) {
+      const section = document.getElementById(sectionId);
+      const empty = section.querySelector(".empty");
+      if (empty) empty.remove();
+    }
+
+    // ── Init ──────────────────────────────────────────
+
+    document.getElementById("chip-filter").addEventListener("change", renderAll);
+    document.getElementById("scale-filter").addEventListener("change", renderAll);
+
+    // Check for deep link
+    const params = new URLSearchParams(window.location.search);
+    const deepId = params.get("id");
+    if (deepId) {
+      fetch(`${API}/api/result/${deepId}`)
+        .then((r) => r.json())
+        .then((data) => {
+          if (data.error) return;
+          // TODO: highlight this result after table renders
+        })
+        .catch(() => {});
+    }
+
+    loadLeaderboard();
+  </script>
+</body>
+</html>

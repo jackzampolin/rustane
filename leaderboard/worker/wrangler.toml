@@ -1,0 +1,14 @@
+name = "rustane-bench-api"
+main = "src/index.js"
+compatibility_date = "2026-03-19"
+account_id = "1c534318dae402469ffaa2573af5b5b9"
+
+[vars]
+ENVIRONMENT = "production"
+
+[[kv_namespaces]]
+binding = "LEADERBOARD"
+id = "8a0da4199c9645f69f7e7ef5e3e11d8f"
+
+# Custom domain configured via CF dashboard/API
+# Worker serves at: api.bench.rustane.org
