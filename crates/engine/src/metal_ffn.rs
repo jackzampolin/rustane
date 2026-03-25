@@ -1,6 +1,6 @@
-//! Metal GPU FFN path using MPS GEMMs plus a small SwiGLU gate kernel.
+//! Metal GPU FFN path using MPS GEMMs plus a small configurable gate kernel.
 
-use crate::model::ModelConfig;
+use crate::model::{FfnActivation, ModelConfig};
 use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -26,6 +26,17 @@ kernel void silu_gate(
     float x = h1[id];
     float sig = 1.0f / (1.0f + exp(-x));
     gate[id] = x * sig * h3[id];
+}
+
+kernel void leaky_relu_sq_gate(
+    device const float* h1 [[buffer(0)]],
+    device const float* h3 [[buffer(1)]],
+    device float* gate [[buffer(2)]],
+    uint id [[thread_position_in_grid]]
+) {
+    float x = h1[id];
+    float l = max(x, 0.5f * x);
+    gate[id] = l * l * h3[id];
 }
 "#;
 
@@ -60,7 +71,10 @@ impl MetalFFN {
         let library = device
             .newLibraryWithSource_options_error(&source, None)
             .ok()?;
-        let fn_name = NSString::from_str("silu_gate");
+        let fn_name = NSString::from_str(match cfg.ffn_activation {
+            FfnActivation::SwiGlu => "silu_gate",
+            FfnActivation::LeakyReluSq => "leaky_relu_sq_gate",
+        });
         let function = library.newFunctionWithName(&fn_name)?;
         let gate_pipeline = device
             .newComputePipelineStateWithFunction_error(&function)

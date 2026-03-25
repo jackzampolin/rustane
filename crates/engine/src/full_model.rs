@@ -10,10 +10,12 @@ use crate::layer::{
 };
 use crate::metal_adam::MetalAdam;
 use crate::metal_ffn::MetalFFN;
+use crate::metal_muon::MetalMuon;
 use crate::model::ModelConfig;
 use crate::training::LayerOptState;
 
 /// Full model weights.
+#[derive(Clone)]
 pub struct ModelWeights {
     pub embed: Vec<f32>, // [VOCAB * DIM]
     pub layers: Vec<LayerWeights>,
@@ -52,6 +54,9 @@ pub struct TrainConfig {
     pub accum_steps: u32,
     pub grad_clip: f32,
     pub softcap: f32,
+    pub ema_decay: Option<f32>,
+    pub swa_interval: Option<u32>,
+    pub swa_start_frac: Option<f32>,
 }
 
 impl Default for TrainConfig {
@@ -71,6 +76,27 @@ impl Default for TrainConfig {
             accum_steps: 10,
             grad_clip: 1.0,
             softcap: 0.0, // was 15.0 — A/B test showed identical loss, saves ~5ms/microbatch
+            ema_decay: None,
+            swa_interval: None,
+            swa_start_frac: None,
+        }
+    }
+}
+
+/// Muon optimizer hyperparameters for matrix-shaped layer weights.
+#[derive(Clone, Copy, Debug)]
+pub struct MuonConfig {
+    pub muon_lr: f32,
+    pub muon_momentum: f32,
+    pub newton_schulz_steps: u32,
+}
+
+impl Default for MuonConfig {
+    fn default() -> Self {
+        Self {
+            muon_lr: 0.025,
+            muon_momentum: 0.95,
+            newton_schulz_steps: 5,
         }
     }
 }
@@ -133,6 +159,38 @@ impl ModelWeights {
                 .map(|_| LayerWeights::random(cfg))
                 .collect(),
             gamma_final: vec![1.0; cfg.dim],
+        }
+    }
+
+    pub fn blend_towards(&mut self, src: &Self, amount: f32) {
+        debug_assert!((0.0..=1.0).contains(&amount));
+        if amount <= 0.0 {
+            return;
+        }
+        if amount >= 1.0 {
+            *self = src.clone();
+            return;
+        }
+
+        blend_slice_towards(&mut self.embed, &src.embed, amount);
+        blend_slice_towards(&mut self.gamma_final, &src.gamma_final, amount);
+        for (dst_layer, src_layer) in self.layers.iter_mut().zip(&src.layers) {
+            blend_slice_towards(&mut dst_layer.wq, &src_layer.wq, amount);
+            blend_slice_towards(&mut dst_layer.wk, &src_layer.wk, amount);
+            blend_slice_towards(&mut dst_layer.wv, &src_layer.wv, amount);
+            blend_slice_towards(&mut dst_layer.wo, &src_layer.wo, amount);
+            blend_slice_towards(&mut dst_layer.w1, &src_layer.w1, amount);
+            blend_slice_towards(&mut dst_layer.w3, &src_layer.w3, amount);
+            blend_slice_towards(&mut dst_layer.w2, &src_layer.w2, amount);
+            blend_slice_towards(&mut dst_layer.wqt, &src_layer.wqt, amount);
+            blend_slice_towards(&mut dst_layer.wkt, &src_layer.wkt, amount);
+            blend_slice_towards(&mut dst_layer.wvt, &src_layer.wvt, amount);
+            blend_slice_towards(&mut dst_layer.wot, &src_layer.wot, amount);
+            blend_slice_towards(&mut dst_layer.w1t, &src_layer.w1t, amount);
+            blend_slice_towards(&mut dst_layer.w3t, &src_layer.w3t, amount);
+            blend_slice_towards(&mut dst_layer.gamma1, &src_layer.gamma1, amount);
+            blend_slice_towards(&mut dst_layer.gamma2, &src_layer.gamma2, amount);
+            dst_layer.generation = src_layer.generation;
         }
     }
 }
@@ -599,6 +657,36 @@ pub fn learning_rate(step: u32, tc: &TrainConfig) -> f32 {
     }
 }
 
+pub fn learning_rate_scale(step: u32, tc: &TrainConfig) -> f32 {
+    if tc.max_lr <= 0.0 {
+        0.0
+    } else {
+        learning_rate(step, tc) / tc.max_lr
+    }
+}
+
+pub fn should_collect_swa(step_completed: u32, tc: &TrainConfig) -> bool {
+    let Some(interval) = tc.swa_interval else {
+        return false;
+    };
+    if interval == 0 || step_completed == 0 || step_completed % interval != 0 {
+        return false;
+    }
+    let lr_step = step_completed - 1;
+    if lr_step < tc.warmup_steps {
+        return false;
+    }
+    if let Some(start_frac) = tc.swa_start_frac {
+        let decay_steps = tc.total_steps.saturating_sub(tc.warmup_steps);
+        if decay_steps == 0 {
+            return false;
+        }
+        let decay_progress = (lr_step - tc.warmup_steps) as f32 / decay_steps as f32;
+        return decay_progress >= (1.0 - start_frac);
+    }
+    learning_rate_scale(lr_step, tc) < 0.5
+}
+
 /// Full forward pass: embedding → NL layers → final norm → logits → loss.
 pub fn forward(
     cfg: &ModelConfig,
@@ -961,6 +1049,75 @@ pub fn update_weights(
     });
 }
 
+/// Split optimizer path: Muon for layer matrices, Adam for embeddings and RMSNorm gammas.
+pub fn update_weights_muon(
+    cfg: &ModelConfig,
+    weights: &mut ModelWeights,
+    grads: &ModelGrads,
+    opt: &mut ModelOptState,
+    t: u32,
+    lr: f32,
+    tc: &TrainConfig,
+    muon_cfg: &MuonConfig,
+    _metal_adam: &MetalAdam,
+    metal_muon: &MetalMuon,
+    grad_scale: f32,
+) {
+    use crate::cpu::adam::step_fused;
+
+    let wd = tc.weight_decay;
+    let embed_lr = lr * tc.embed_lr_scale;
+    let lr_mul = if tc.max_lr > 0.0 { lr / tc.max_lr } else { 1.0 };
+    let matrix_lr = muon_cfg.muon_lr * lr_mul;
+    let (b1, b2, eps) = (tc.beta1, tc.beta2, tc.eps);
+
+    step_fused(
+        &mut weights.embed,
+        &grads.dembed,
+        &mut opt.embed_m,
+        &mut opt.embed_v,
+        t,
+        embed_lr,
+        b1,
+        b2,
+        eps,
+        0.0,
+        grad_scale,
+    );
+    step_fused(
+        &mut weights.gamma_final,
+        &grads.dgamma_final,
+        &mut opt.gamma_final_m,
+        &mut opt.gamma_final_v,
+        t,
+        lr,
+        b1,
+        b2,
+        eps,
+        0.0,
+        grad_scale,
+    );
+
+    for l in 0..cfg.nlayers {
+        update_layer_muon(
+            cfg,
+            &mut weights.layers[l],
+            &grads.layers[l],
+            &mut opt.layers[l],
+            t,
+            lr,
+            b1,
+            b2,
+            eps,
+            wd,
+            matrix_lr,
+            muon_cfg,
+            metal_muon,
+            grad_scale,
+        );
+    }
+}
+
 /// Update all weight tensors in a single layer.
 #[inline]
 fn update_layer(
@@ -1099,6 +1256,178 @@ fn update_layer(
     w.generation += 1;
 }
 
+#[allow(clippy::too_many_arguments)]
+fn update_layer_muon(
+    cfg: &ModelConfig,
+    w: &mut LayerWeights,
+    g: &LayerGrads,
+    o: &mut LayerOptState,
+    t: u32,
+    lr: f32,
+    b1: f32,
+    b2: f32,
+    eps: f32,
+    wd: f32,
+    matrix_lr: f32,
+    muon_cfg: &MuonConfig,
+    metal_muon: &MetalMuon,
+    grad_scale: f32,
+) {
+    use crate::cpu::adam::step_fused;
+
+    muon_step_matrix(
+        &mut w.wq,
+        &g.dwq,
+        &mut o.m_wq,
+        &mut o.v_wq,
+        cfg.dim,
+        cfg.q_dim,
+        matrix_lr,
+        wd,
+        muon_cfg,
+        metal_muon,
+        grad_scale,
+    );
+    muon_step_matrix(
+        &mut w.wk,
+        &g.dwk,
+        &mut o.m_wk,
+        &mut o.v_wk,
+        cfg.dim,
+        cfg.kv_dim,
+        matrix_lr,
+        wd,
+        muon_cfg,
+        metal_muon,
+        grad_scale,
+    );
+    muon_step_matrix(
+        &mut w.wv,
+        &g.dwv,
+        &mut o.m_wv,
+        &mut o.v_wv,
+        cfg.dim,
+        cfg.kv_dim,
+        matrix_lr,
+        wd,
+        muon_cfg,
+        metal_muon,
+        grad_scale,
+    );
+    muon_step_matrix(
+        &mut w.wo,
+        &g.dwo,
+        &mut o.m_wo,
+        &mut o.v_wo,
+        cfg.q_dim,
+        cfg.dim,
+        matrix_lr,
+        wd,
+        muon_cfg,
+        metal_muon,
+        grad_scale,
+    );
+    muon_step_matrix(
+        &mut w.w1,
+        &g.dw1,
+        &mut o.m_w1,
+        &mut o.v_w1,
+        cfg.dim,
+        cfg.hidden,
+        matrix_lr,
+        wd,
+        muon_cfg,
+        metal_muon,
+        grad_scale,
+    );
+    muon_step_matrix(
+        &mut w.w3,
+        &g.dw3,
+        &mut o.m_w3,
+        &mut o.v_w3,
+        cfg.dim,
+        cfg.hidden,
+        matrix_lr,
+        wd,
+        muon_cfg,
+        metal_muon,
+        grad_scale,
+    );
+    muon_step_matrix(
+        &mut w.w2,
+        &g.dw2,
+        &mut o.m_w2,
+        &mut o.v_w2,
+        cfg.dim,
+        cfg.hidden,
+        matrix_lr,
+        wd,
+        muon_cfg,
+        metal_muon,
+        grad_scale,
+    );
+
+    step_fused(
+        &mut w.gamma1,
+        &g.dgamma1,
+        &mut o.m_gamma1,
+        &mut o.v_gamma1,
+        t,
+        lr,
+        b1,
+        b2,
+        eps,
+        0.0,
+        grad_scale,
+    );
+    step_fused(
+        &mut w.gamma2,
+        &g.dgamma2,
+        &mut o.m_gamma2,
+        &mut o.v_gamma2,
+        t,
+        lr,
+        b1,
+        b2,
+        eps,
+        0.0,
+        grad_scale,
+    );
+    w.refresh_transposes(cfg);
+    w.generation += 1;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn muon_step_matrix(
+    param: &mut [f32],
+    grad: &[f32],
+    momentum_buf: &mut [f32],
+    scratch: &mut [f32],
+    rows: usize,
+    cols: usize,
+    lr: f32,
+    wd: f32,
+    muon_cfg: &MuonConfig,
+    metal_muon: &MetalMuon,
+    grad_scale: f32,
+) {
+    debug_assert_eq!(param.len(), grad.len());
+    debug_assert_eq!(param.len(), momentum_buf.len());
+    debug_assert_eq!(param.len(), scratch.len());
+
+    for i in 0..grad.len() {
+        let g = grad[i] * grad_scale;
+        momentum_buf[i] = muon_cfg.muon_momentum * momentum_buf[i] + g;
+        scratch[i] = g + muon_cfg.muon_momentum * momentum_buf[i];
+    }
+    metal_muon.orthogonalize_inplace(rows, cols, scratch, muon_cfg.newton_schulz_steps);
+    let scale = ((rows as f32 / cols as f32).max(1.0)).sqrt();
+    for i in 0..param.len() {
+        let decay = wd * param[i];
+        param[i] -= lr * (scratch[i] * scale + decay);
+    }
+}
+
 fn layer_grad_sq_sum(lg: &LayerGrads) -> f32 {
     let mut sum = 0.0f32;
     for g in [
@@ -1192,6 +1521,13 @@ fn random_vec(n: usize, scale: f32) -> Vec<f32> {
         *x = r * scale;
     }
     v
+}
+
+fn blend_slice_towards(dst: &mut [f32], src: &[f32], amount: f32) {
+    debug_assert_eq!(dst.len(), src.len());
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d += (s - *d) * amount;
+    }
 }
 
 /// Run one full training step with gradient accumulation.
@@ -1342,4 +1678,74 @@ pub fn forward_losses(
         losses[s] = loss;
     }
     losses
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModelWeights, TrainConfig, should_collect_swa};
+    use crate::model::ModelConfig;
+
+    #[test]
+    fn blend_towards_matches_expected_weighted_average() {
+        let cfg = ModelConfig::gpt_karpathy();
+        let mut dst = ModelWeights::random(&cfg);
+        let mut src = dst.clone();
+
+        dst.embed[0] = 2.0;
+        dst.gamma_final[0] = 4.0;
+        dst.layers[0].wq[0] = 6.0;
+        dst.layers[0].wqt[0] = 8.0;
+        dst.layers[0].gamma1[0] = 10.0;
+
+        src.embed[0] = 10.0;
+        src.gamma_final[0] = 20.0;
+        src.layers[0].wq[0] = 30.0;
+        src.layers[0].wqt[0] = 40.0;
+        src.layers[0].gamma1[0] = 50.0;
+        src.layers[0].generation = 7;
+
+        dst.blend_towards(&src, 0.25);
+
+        assert!((dst.embed[0] - 4.0).abs() < 1e-6);
+        assert!((dst.gamma_final[0] - 8.0).abs() < 1e-6);
+        assert!((dst.layers[0].wq[0] - 12.0).abs() < 1e-6);
+        assert!((dst.layers[0].wqt[0] - 16.0).abs() < 1e-6);
+        assert!((dst.layers[0].gamma1[0] - 20.0).abs() < 1e-6);
+        assert_eq!(dst.layers[0].generation, 7);
+    }
+
+    #[test]
+    fn swa_collection_waits_for_late_lr_phase_and_interval() {
+        let tc = TrainConfig {
+            max_lr: 1.0,
+            min_lr_frac: 0.1,
+            warmup_steps: 0,
+            total_steps: 100,
+            swa_interval: Some(10),
+            ..Default::default()
+        };
+
+        assert!(!should_collect_swa(10, &tc));
+        assert!(!should_collect_swa(50, &tc));
+        assert!(should_collect_swa(70, &tc));
+        assert!(!should_collect_swa(71, &tc));
+    }
+
+    #[test]
+    fn swa_collection_can_use_decay_phase_fraction() {
+        let tc = TrainConfig {
+            max_lr: 1.0,
+            min_lr_frac: 0.1,
+            warmup_steps: 10,
+            total_steps: 110,
+            swa_interval: Some(10),
+            swa_start_frac: Some(0.4),
+            ..Default::default()
+        };
+
+        assert!(!should_collect_swa(60, &tc));
+        assert!(!should_collect_swa(70, &tc));
+        assert!(should_collect_swa(80, &tc));
+        assert!(should_collect_swa(100, &tc));
+    }
 }

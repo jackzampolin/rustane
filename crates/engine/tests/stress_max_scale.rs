@@ -8,7 +8,7 @@ use engine::full_model::{
 };
 use engine::layer::CompiledKernels;
 use engine::metal_adam::MetalAdam;
-use engine::model::ModelConfig;
+use engine::model::{FfnActivation, ModelConfig};
 use std::time::Instant;
 
 fn make_config(dim: usize, hidden: usize, heads: usize, nlayers: usize) -> ModelConfig {
@@ -24,6 +24,7 @@ fn make_config(dim: usize, hidden: usize, heads: usize, nlayers: usize) -> Model
         q_dim: dim,
         kv_dim: dim,
         gqa_ratio: 1,
+        ffn_activation: FfnActivation::SwiGlu,
     }
 }
 

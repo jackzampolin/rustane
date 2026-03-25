@@ -21,7 +21,7 @@ use engine::cpu::adam;
 use engine::full_model::{ModelGrads, ModelOptState, ModelWeights, TrainConfig, update_weights};
 use engine::layer::{LayerGrads, LayerWeights};
 use engine::metal_adam::MetalAdam;
-use engine::model::ModelConfig;
+use engine::model::{FfnActivation, ModelConfig};
 use engine::training::LayerOptState;
 
 fn make_data(n: usize, seed: u64, scale: f32) -> Vec<f32> {
@@ -50,6 +50,7 @@ fn gpt_config() -> ModelConfig {
         kv_dim: 256,
         gqa_ratio: 3,
         hidden: 2048,
+        ffn_activation: FfnActivation::SwiGlu,
     }
 }
 

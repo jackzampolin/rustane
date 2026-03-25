@@ -1,7 +1,7 @@
 use engine::decode::DecodeContext;
 use engine::full_model::{self, ModelForwardWorkspace, ModelWeights};
 use engine::layer::CompiledKernels;
-use engine::model::ModelConfig;
+use engine::model::{FfnActivation, ModelConfig};
 
 fn tiny_cfg() -> ModelConfig {
     ModelConfig {
@@ -16,6 +16,7 @@ fn tiny_cfg() -> ModelConfig {
         q_dim: 256,
         kv_dim: 256,
         gqa_ratio: 1,
+        ffn_activation: FfnActivation::SwiGlu,
     }
 }
 

@@ -1286,6 +1286,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine::model::FfnActivation;
 
     #[test]
     fn longest_prefix_match_prefers_deepest_entry() {
@@ -1301,6 +1302,7 @@ mod tests {
             q_dim: 256,
             kv_dim: 256,
             gqa_ratio: 1,
+            ffn_activation: FfnActivation::SwiGlu,
         }));
         let weights = Box::leak(Box::new(engine::full_model::ModelWeights::random(cfg)));
         let kernels = Box::leak(Box::new(CompiledKernels::compile(cfg)));
@@ -1328,6 +1330,7 @@ mod tests {
             q_dim: 256,
             kv_dim: 256,
             gqa_ratio: 1,
+            ffn_activation: FfnActivation::SwiGlu,
         }));
         let weights = Box::leak(Box::new(engine::full_model::ModelWeights::random(cfg)));
         let kernels = Box::leak(Box::new(CompiledKernels::compile(cfg)));

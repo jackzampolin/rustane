@@ -81,7 +81,8 @@ fn all_weight_groups_have_nonzero_gradient() {
                 || *name == "dwk"
                 || *name == "dwv"
                 || *name == "dw1"
-                || *name == "dw3";
+                || *name == "dw3"
+                || *name == "dgamma2";
             if !zero_init_expected {
                 assert!(*norm > 0.0, "layer {l} {name} gradient is zero");
             }
@@ -701,47 +702,35 @@ fn diagnose_ffn_fused_output() {
         }
     }
 
-    // Stage into ffnFused format
-    let ffn_sp = ffn_fused::input_spatial_width(&cfg);
-    let mut ffn_in = vec![0.0f32; dim * ffn_sp];
-    // stage_spatial manually:
-    for c in 0..dim {
-        for s in 0..seq {
-            ffn_in[c * ffn_sp + s] = x2norm[c * seq + s];
-        }
-        for s in 0..seq {
-            ffn_in[c * ffn_sp + seq + s] = x2[c * seq + s];
-        }
-        for h in 0..hidden {
-            ffn_in[c * ffn_sp + 2 * seq + h] = weights.layers[0].w1[c * hidden + h];
-        }
-        for h in 0..hidden {
-            ffn_in[c * ffn_sp + 2 * seq + hidden + h] = weights.layers[0].w3[c * hidden + h];
-        }
-        for h in 0..hidden {
-            ffn_in[c * ffn_sp + 2 * seq + 2 * hidden + h] = weights.layers[0].w2[c * hidden + h];
-        }
-    }
-
-    // Run on ANE
+    // Run on ANE using the split-input kernel variant used by training.
     let ffn_out_ch = ffn_fused::output_channels(&cfg);
-    let in_shape = Shape {
-        batch: 1,
-        channels: dim,
-        height: 1,
-        width: ffn_sp,
-    };
     let out_shape = Shape {
         batch: 1,
         channels: ffn_out_ch,
         height: 1,
         width: seq,
     };
-    let input_td = TensorData::with_f32(&ffn_in, in_shape);
+    let x_shape = Shape {
+        batch: 1,
+        channels: dim,
+        height: 1,
+        width: seq,
+    };
+    let w_shape = Shape {
+        batch: 1,
+        channels: dim,
+        height: 1,
+        width: hidden,
+    };
+    let x2norm_td = TensorData::with_f32(&x2norm, x_shape);
+    let x2_td = TensorData::with_f32(&x2, x_shape);
+    let w1_td = TensorData::with_f32(&weights.layers[0].w1, w_shape);
+    let w3_td = TensorData::with_f32(&weights.layers[0].w3, w_shape);
+    let w2_td = TensorData::with_f32(&weights.layers[0].w2, w_shape);
     let output_td = TensorData::new(out_shape);
     kernels
         .ffn_fused
-        .run(&[&input_td], &[&output_td])
+        .run(&[&x2norm_td, &x2_td, &w1_td, &w3_td, &w2_td], &[&output_td])
         .expect("ffnFused eval");
     let ane_out = output_td.read_f32().to_vec();
 
@@ -836,7 +825,6 @@ fn diagnose_ffn_fused_output() {
 #[test]
 fn diagnose_ffn_bwd_w2t_kernel() {
     use ane_bridge::ane::{Shape, TensorData};
-    use engine::kernels::dyn_matmul;
 
     let cfg = ModelConfig::gpt_karpathy();
     let kernels = CompiledKernels::compile(&cfg);

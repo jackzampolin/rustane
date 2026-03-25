@@ -1,4 +1,4 @@
-//! Fused FFN forward kernel: SwiGLU gate + up + down + residual.
+//! Fused FFN forward kernel: configurable gate activation + up + down + residual.
 //!
 //! Input IOSurface: [1, DIM, 1, 2*SEQ + 3*HIDDEN]
 //!   sp[0:SEQ]                     = x2norm [DIM, SEQ]  (post-RMSNorm input)
@@ -12,10 +12,10 @@
 //!   where x_next = x2 + alpha * (gate_out @ W2^T)
 //!
 //! h1 = xnorm @ W1 (gate), h3 = xnorm @ W3 (up)
-//! gate_out = silu(h1) * h3
+//! gate_out = activation(h1) * h3
 //! ffn_out = gate_out @ W2^T  (W2 stored as [DIM,HIDDEN], transposed inside kernel)
 
-use crate::model::ModelConfig;
+use crate::model::{FfnActivation, ModelConfig};
 use ane_bridge::ane::{Graph, Shape};
 
 fn build_impl(cfg: &ModelConfig, split_inputs: bool) -> Graph {
@@ -136,10 +136,18 @@ fn build_impl(cfg: &ModelConfig, split_inputs: bool) -> Graph {
         },
     );
 
-    // ── SiLU gate: silu(h1) * h3 ──
-    let sig = g.sigmoid(h1);
-    let silu = g.multiplication(h1, sig);
-    let gate = g.multiplication(silu, h3);
+    // ── Gate activation: configurable activation(h1) * h3 ──
+    let gate_act = match cfg.ffn_activation {
+        FfnActivation::SwiGlu => {
+            let sig = g.sigmoid(h1);
+            g.multiplication(h1, sig)
+        }
+        FfnActivation::LeakyReluSq => {
+            let leaky = g.leaky_relu(h1, 0.5);
+            g.multiplication(leaky, leaky)
+        }
+    };
+    let gate = g.multiplication(gate_act, h3);
 
     // ── Down projection: gate @ W2^T ──
     // W2 stored as [DIM, HIDDEN], need transpose for gate[HIDDEN,SEQ] @ W2^T → [DIM,SEQ]

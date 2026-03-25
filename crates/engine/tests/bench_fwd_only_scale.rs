@@ -9,7 +9,7 @@
 use engine::bench_result;
 use engine::full_model::{self, ModelForwardWorkspace, ModelWeights, TrainConfig};
 use engine::layer::CompiledKernels;
-use engine::model::ModelConfig;
+use engine::model::{FfnActivation, ModelConfig};
 use std::time::Instant;
 
 /// Build a custom ModelConfig (all MHA, hd=128, vocab=8192).
@@ -32,6 +32,7 @@ fn custom_config(
         q_dim: heads * 128,
         kv_dim: heads * 128,
         gqa_ratio: 1,
+        ffn_activation: FfnActivation::SwiGlu,
     }
 }
 

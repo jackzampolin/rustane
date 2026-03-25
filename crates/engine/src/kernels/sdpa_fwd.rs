@@ -12,7 +12,7 @@
 //! For gpt_karpathy (MHA): Q_DIM = KV_DIM = DIM = 768, HEADS = KV_HEADS = 6
 
 use crate::model::ModelConfig;
-use ane_bridge::ane::{Graph, Shape};
+use ane_bridge::ane::{Graph, Shape, Tensor};
 
 /// Generate RoPE cos/sin tables as f32 data for BLOBFILE constants.
 fn rope_table(seq: usize, hd: usize) -> (Vec<f32>, Vec<f32>) {
@@ -45,13 +45,36 @@ fn causal_mask(seq: usize) -> Vec<f32> {
     mask
 }
 
+fn tile_kv_heads(
+    g: &mut Graph,
+    kv: Tensor,
+    kv_heads: usize,
+    gqa_ratio: usize,
+    seq: usize,
+    hd: usize,
+) -> Tensor {
+    if gqa_ratio == 1 {
+        return kv;
+    }
+    let mut tiled = Vec::with_capacity(kv_heads * gqa_ratio);
+    for kv_head in 0..kv_heads {
+        let head = g.slice(kv, [0, kv_head, 0, 0], [1, 1, seq, hd]);
+        for _ in 0..gqa_ratio {
+            tiled.push(head);
+        }
+    }
+    g.concat(&tiled, 1)
+}
+
 fn build_impl(cfg: &ModelConfig, split_inputs: bool) -> Graph {
     let seq = cfg.seq;
     let dim = cfg.dim;
     let q_dim = cfg.q_dim;
     let kv_dim = cfg.kv_dim;
     let heads = cfg.heads;
+    let kv_heads = cfg.kv_heads;
     let hd = cfg.hd;
+    let gqa_ratio = cfg.gqa_ratio;
 
     let sp_in = seq + q_dim + kv_dim + kv_dim;
     let scale = 1.0 / (hd as f32).sqrt();
@@ -192,22 +215,24 @@ fn build_impl(cfg: &ModelConfig, split_inputs: bool) -> Graph {
         kf,
         Shape {
             batch: 1,
-            channels: heads,
+            channels: kv_heads,
             height: hd,
             width: seq,
         },
     );
-    let k = g.transpose(k4, [0, 1, 3, 2]);
+    let k_base = g.transpose(k4, [0, 1, 3, 2]);
+    let k = tile_kv_heads(&mut g, k_base, kv_heads, gqa_ratio, seq, hd);
     let v4 = g.reshape(
         vf,
         Shape {
             batch: 1,
-            channels: heads,
+            channels: kv_heads,
             height: hd,
             width: seq,
         },
     );
-    let v = g.transpose(v4, [0, 1, 3, 2]);
+    let v_base = g.transpose(v4, [0, 1, 3, 2]);
+    let v = tile_kv_heads(&mut g, v_base, kv_heads, gqa_ratio, seq, hd);
 
     // ── RoPE ──
     let (cos_data, sin_data) = rope_table(seq, hd);
@@ -356,14 +381,24 @@ fn build_impl(cfg: &ModelConfig, split_inputs: bool) -> Graph {
         krt,
         Shape {
             batch: 1,
-            channels: kv_dim,
+            channels: q_dim,
+            height: 1,
+            width: seq,
+        },
+    );
+    let vt = g.transpose(v, [0, 1, 3, 2]);
+    let vf_tiled = g.reshape(
+        vt,
+        Shape {
+            batch: 1,
+            channels: q_dim,
             height: 1,
             width: seq,
         },
     );
 
     // ── Output: concat(attn_out, Q_rope, K_rope, V, xnorm_passthrough) ──
-    let _out = g.concat(&[af, qrf, krf, vf, xn], 1);
+    let _out = g.concat(&[af, qrf, krf, vf_tiled, xn], 1);
 
     g
 }
@@ -386,5 +421,5 @@ pub fn input_spatial_width(cfg: &ModelConfig) -> usize {
 
 /// Output channel count for sdpaFwd.
 pub fn output_channels(cfg: &ModelConfig) -> usize {
-    cfg.q_dim + cfg.q_dim + cfg.kv_dim + cfg.kv_dim + cfg.dim
+    cfg.q_dim + cfg.q_dim + cfg.q_dim + cfg.q_dim + cfg.dim
 }

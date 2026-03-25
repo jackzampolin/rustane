@@ -1,7 +1,7 @@
 use engine::cpu::embedding;
 use engine::decode::DecodeContext;
 use engine::full_model::ModelWeights;
-use engine::model::ModelConfig;
+use engine::model::{FfnActivation, ModelConfig};
 use metal_decode::{Config as MetalConfig, FinalHeadInit, LayerInit, Model as MetalDecodeModel};
 use std::time::Instant;
 
@@ -18,6 +18,7 @@ fn medium_cfg() -> ModelConfig {
         q_dim: 768,
         kv_dim: 768,
         gqa_ratio: 1,
+        ffn_activation: FfnActivation::SwiGlu,
     }
 }
 

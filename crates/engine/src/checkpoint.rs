@@ -2,17 +2,19 @@
 //!
 //! Checkpoints are written by `src/bin/train.rs` as:
 //! magic("RSTK"), version(u32), step(u32), dim(u32), nlayers(u32), vocab(u32), seq(u32),
+//! optionally activation(u32) for version >= 2,
 //! followed by f32 weights in little-endian order.
 
 use crate::full_model::ModelWeights;
 use crate::layer::LayerWeights;
-use crate::model::ModelConfig;
+use crate::model::{FfnActivation, ModelConfig};
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
 const MAGIC: &[u8; 4] = b"RSTK";
-const VERSION: u32 = 1;
-const HEADER_BYTES: usize = 4 + 6 * 4;
+const VERSION: u32 = 2;
+const HEADER_BYTES_V1: usize = 4 + 6 * 4;
+const HEADER_BYTES_V2: usize = 4 + 7 * 4;
 
 pub struct Checkpoint {
     pub cfg: ModelConfig,
@@ -26,7 +28,7 @@ pub fn load_checkpoint(path: &Path) -> io::Result<Checkpoint> {
 }
 
 fn parse_checkpoint(bytes: &[u8]) -> io::Result<Checkpoint> {
-    if bytes.len() < HEADER_BYTES {
+    if bytes.len() < HEADER_BYTES_V1 {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             "checkpoint too small for header",
@@ -42,10 +44,16 @@ fn parse_checkpoint(bytes: &[u8]) -> io::Result<Checkpoint> {
 
     let mut cursor = 4;
     let version = read_u32(bytes, &mut cursor)?;
-    if version != VERSION {
+    if !(1..=VERSION).contains(&version) {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             format!("unsupported checkpoint version {version}"),
+        ));
+    }
+    if version >= 2 && bytes.len() < HEADER_BYTES_V2 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "checkpoint too small for v2 header",
         ));
     }
 
@@ -54,6 +62,17 @@ fn parse_checkpoint(bytes: &[u8]) -> io::Result<Checkpoint> {
     let nlayers = read_u32(bytes, &mut cursor)? as usize;
     let vocab = read_u32(bytes, &mut cursor)? as usize;
     let seq = read_u32(bytes, &mut cursor)? as usize;
+    let ffn_activation = if version >= 2 {
+        let code = read_u32(bytes, &mut cursor)?;
+        FfnActivation::from_checkpoint_code(code).ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("unsupported checkpoint activation code {code}"),
+            )
+        })?
+    } else {
+        FfnActivation::SwiGlu
+    };
 
     if dim == 0 || nlayers == 0 || vocab == 0 || seq == 0 {
         return Err(io::Error::new(
@@ -89,6 +108,7 @@ fn parse_checkpoint(bytes: &[u8]) -> io::Result<Checkpoint> {
         q_dim: dim,
         kv_dim: dim,
         gqa_ratio: 1,
+        ffn_activation,
     };
 
     let embed = read_f32_vec(bytes, &mut cursor, vocab * dim)?;
@@ -245,6 +265,7 @@ mod tests {
             q_dim: 256,
             kv_dim: 256,
             gqa_ratio: 1,
+            ffn_activation: FfnActivation::SwiGlu,
         };
         let weights = ModelWeights::random(&cfg);
 
@@ -256,6 +277,7 @@ mod tests {
         bytes.extend_from_slice(&(cfg.nlayers as u32).to_le_bytes());
         bytes.extend_from_slice(&(cfg.vocab as u32).to_le_bytes());
         bytes.extend_from_slice(&(cfg.seq as u32).to_le_bytes());
+        bytes.extend_from_slice(&cfg.ffn_activation.checkpoint_code().to_le_bytes());
         write_f32_vec(&mut bytes, &weights.embed);
         write_f32_vec(&mut bytes, &weights.gamma_final);
         for layer in &weights.layers {
@@ -281,6 +303,7 @@ mod tests {
         assert_eq!(ckpt.cfg.nlayers, cfg.nlayers);
         assert_eq!(ckpt.cfg.vocab, cfg.vocab);
         assert_eq!(ckpt.cfg.seq, cfg.seq);
+        assert_eq!(ckpt.cfg.ffn_activation, cfg.ffn_activation);
         assert_eq!(ckpt.weights.embed, weights.embed);
         assert_eq!(ckpt.weights.gamma_final, weights.gamma_final);
         assert_eq!(ckpt.weights.layers.len(), weights.layers.len());

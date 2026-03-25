@@ -8,13 +8,14 @@
 use crate::cpu::{rmsnorm, vdsp};
 use crate::kernels::{dyn_matmul, ffn_fused, sdpa_bwd, sdpa_fwd};
 use crate::metal_ffn::MetalFFN;
-use crate::model::ModelConfig;
+use crate::model::{FfnActivation, ModelConfig};
 use ane_bridge::ane::{Executable, Shape, TensorData};
 use objc2_foundation::NSQualityOfService;
 use std::sync::OnceLock;
 use std::time::Instant;
 
 /// Per-layer weights (f32, CPU-side).
+#[derive(Clone)]
 pub struct LayerWeights {
     pub wq: Vec<f32>,     // [DIM * Q_DIM]
     pub wk: Vec<f32>,     // [DIM * KV_DIM]
@@ -53,8 +54,8 @@ pub struct ForwardCache {
     pub xnorm: Vec<f32>,    // after RMSNorm1 [DIM * SEQ]
     pub rms_inv1: Vec<f32>, // per-position rms_inv [SEQ]
     pub q_rope: Vec<f32>,   // [Q_DIM * SEQ]
-    pub k_rope: Vec<f32>,   // [KV_DIM * SEQ]
-    pub v: Vec<f32>,        // [KV_DIM * SEQ]
+    pub k_rope: Vec<f32>,   // [Q_DIM * SEQ] (GQA tiles KV heads to query-head layout)
+    pub v: Vec<f32>,        // [Q_DIM * SEQ] (GQA tiles KV heads to query-head layout)
     pub attn_out: Vec<f32>, // [Q_DIM * SEQ]
     pub o_out: Vec<f32>,    // woFwd output [DIM * SEQ]
     pub x2: Vec<f32>,       // post-attn residual [DIM * SEQ]
@@ -72,15 +73,14 @@ impl ForwardCache {
         let dim = cfg.dim;
         let seq = cfg.seq;
         let q_dim = cfg.q_dim;
-        let kv_dim = cfg.kv_dim;
         let hidden = cfg.hidden;
         Self {
             x: vec![0.0; dim * seq],
             xnorm: vec![0.0; dim * seq],
             rms_inv1: vec![0.0; seq],
             q_rope: vec![0.0; q_dim * seq],
-            k_rope: vec![0.0; kv_dim * seq],
-            v: vec![0.0; kv_dim * seq],
+            k_rope: vec![0.0; q_dim * seq],
+            v: vec![0.0; q_dim * seq],
             attn_out: vec![0.0; q_dim * seq],
             o_out: vec![0.0; dim * seq],
             x2: vec![0.0; dim * seq],
@@ -117,7 +117,6 @@ pub struct KernelBuffers {
     ffn_bwd_w2t_dffn: TensorData,
     ffn_bwd_w2t_w2: TensorData,
     ffn_bwd_w2t_out: TensorData,
-    ffn_bwd_w13t_in: TensorData,
     ffn_bwd_w13t_dh1: TensorData,
     ffn_bwd_w13t_dh3: TensorData,
     ffn_bwd_w13t_w1t: TensorData,
@@ -263,13 +262,6 @@ impl KernelBuffers {
         });
 
         // Backward: ffn_bwd_w13t
-        let w13t_sp = dyn_matmul::dual_spatial_width(seq, dim);
-        let ffn_bwd_w13t_in = TensorData::new(Shape {
-            batch: 1,
-            channels: hidden,
-            height: 1,
-            width: w13t_sp,
-        });
         let ffn_bwd_w13t_dh1 = TensorData::new(Shape {
             batch: 1,
             channels: hidden,
@@ -428,7 +420,6 @@ impl KernelBuffers {
             ffn_bwd_w2t_dffn,
             ffn_bwd_w2t_w2,
             ffn_bwd_w2t_out,
-            ffn_bwd_w13t_in,
             ffn_bwd_w13t_dh1,
             ffn_bwd_w13t_dh3,
             ffn_bwd_w13t_w1t,
@@ -647,6 +638,8 @@ pub struct BackwardWorkspace {
     pub dv_full: Vec<f32>,
     pub dq: Vec<f32>,
     pub dk: Vec<f32>,
+    pub dv_kv: Vec<f32>,
+    pub dk_kv: Vec<f32>,
     pub dx_attn: Vec<f32>,
     pub dx_kv: Vec<f32>,
     pub dx_merged: Vec<f32>,
@@ -669,6 +662,7 @@ impl BackwardWorkspace {
         let dim = cfg.dim;
         let seq = cfg.seq;
         let q_dim = cfg.q_dim;
+        let kv_dim = cfg.kv_dim;
         let hidden = cfg.hidden;
         let heads = cfg.heads;
         Self {
@@ -681,6 +675,8 @@ impl BackwardWorkspace {
             dv_full: vec![0.0; q_dim * seq],
             dq: vec![0.0; q_dim * seq],
             dk: vec![0.0; q_dim * seq],
+            dv_kv: vec![0.0; kv_dim * seq],
+            dk_kv: vec![0.0; kv_dim * seq],
             dx_attn: vec![0.0; dim * seq],
             dx_kv: vec![0.0; dim * seq],
             dx_merged: vec![0.0; dim * seq],
@@ -820,24 +816,32 @@ fn random_vec(n: usize, scale: f32) -> Vec<f32> {
     v
 }
 
-// ── Helper: pack f32 data into ANE spatial layout ──
+#[inline]
+fn ffn_gate_activation(cfg: &ModelConfig, x: f32) -> f32 {
+    match cfg.ffn_activation {
+        FfnActivation::SwiGlu => {
+            let sig = 1.0 / (1.0 + (-x).exp());
+            x * sig
+        }
+        FfnActivation::LeakyReluSq => {
+            let l = x.max(0.5 * x);
+            l * l
+        }
+    }
+}
 
-/// Stage activations into IOSurface spatial dimension.
-/// `dst` is [channels * sp_width], `src` is [channels * src_width].
-/// Writes src at spatial offset `sp_offset`.
-/// Uses copy_from_slice for vectorized memcpy on inner dimension.
-fn stage_spatial(
-    dst: &mut [f32],
-    channels: usize,
-    sp_width: usize,
-    src: &[f32],
-    src_width: usize,
-    sp_offset: usize,
-) {
-    for c in 0..channels {
-        let d = c * sp_width + sp_offset;
-        let s = c * src_width;
-        dst[d..d + src_width].copy_from_slice(&src[s..s + src_width]);
+#[inline]
+fn ffn_gate_activation_derivative(cfg: &ModelConfig, x: f32, sig_cache: Option<f32>) -> f32 {
+    match cfg.ffn_activation {
+        FfnActivation::SwiGlu => {
+            let sig = sig_cache.unwrap_or_else(|| 1.0 / (1.0 + (-x).exp()));
+            sig * (1.0 + x * (1.0 - sig))
+        }
+        FfnActivation::LeakyReluSq => {
+            let l = x.max(0.5 * x);
+            let slope = if x > 0.0 { 1.0 } else { 0.5 };
+            2.0 * l * slope
+        }
     }
 }
 
@@ -874,7 +878,6 @@ pub fn forward(
     let dim = cfg.dim;
     let seq = cfg.seq;
     let q_dim = cfg.q_dim;
-    let kv_dim = cfg.kv_dim;
     let hidden = cfg.hidden;
     let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
 
@@ -907,21 +910,14 @@ pub fn forward(
     // Extract: attn_out[Q_DIM,SEQ], Q_rope[Q_DIM,SEQ], K_rope[KV_DIM,SEQ], V[KV_DIM,SEQ]
     let mut attn_out = vec![0.0f32; q_dim * seq];
     let mut q_rope = vec![0.0f32; q_dim * seq];
-    let mut k_rope = vec![0.0f32; kv_dim * seq];
-    let mut v = vec![0.0f32; kv_dim * seq];
+    let mut k_rope = vec![0.0f32; q_dim * seq];
+    let mut v = vec![0.0f32; q_dim * seq];
     {
         let locked = kernels.bufs.sdpa_fwd_out.as_f32_slice();
         read_channels_into(&locked, sdpa_out_ch, seq, 0, q_dim, &mut attn_out);
         read_channels_into(&locked, sdpa_out_ch, seq, q_dim, q_dim, &mut q_rope);
-        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim, kv_dim, &mut k_rope);
-        read_channels_into(
-            &locked,
-            sdpa_out_ch,
-            seq,
-            2 * q_dim + kv_dim,
-            kv_dim,
-            &mut v,
-        );
+        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim, q_dim, &mut k_rope);
+        read_channels_into(&locked, sdpa_out_ch, seq, 3 * q_dim, q_dim, &mut v);
     }
 
     // 4. Stage woFwd directly into IOSurface
@@ -1028,7 +1024,6 @@ pub fn forward_into(
     let dim = cfg.dim;
     let seq = cfg.seq;
     let q_dim = cfg.q_dim;
-    let kv_dim = cfg.kv_dim;
     let hidden = cfg.hidden;
     let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
 
@@ -1091,17 +1086,10 @@ pub fn forward_into(
             sdpa_out_ch,
             seq,
             2 * q_dim,
-            kv_dim,
+            q_dim,
             &mut cache.k_rope,
         );
-        read_channels_into(
-            &locked,
-            sdpa_out_ch,
-            seq,
-            2 * q_dim + kv_dim,
-            kv_dim,
-            &mut cache.v,
-        );
+        read_channels_into(&locked, sdpa_out_ch, seq, 3 * q_dim, q_dim, &mut cache.v);
     }
 
     // 4. Stage woFwd activations only (weights already staged during sdpaFwd)
@@ -1189,7 +1177,6 @@ pub fn forward_into_gpu_ffn(
     let dim = cfg.dim;
     let seq = cfg.seq;
     let q_dim = cfg.q_dim;
-    let kv_dim = cfg.kv_dim;
     let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
 
     cache.x.copy_from_slice(x);
@@ -1241,17 +1228,10 @@ pub fn forward_into_gpu_ffn(
             sdpa_out_ch,
             seq,
             2 * q_dim,
-            kv_dim,
+            q_dim,
             &mut cache.k_rope,
         );
-        read_channels_into(
-            &locked,
-            sdpa_out_ch,
-            seq,
-            2 * q_dim + kv_dim,
-            kv_dim,
-            &mut cache.v,
-        );
+        read_channels_into(&locked, sdpa_out_ch, seq, 3 * q_dim, q_dim, &mut cache.v);
     }
 
     // 4. Stage woFwd activations only
@@ -1316,7 +1296,6 @@ pub fn forward_into_pipelined(
     let dim = cfg.dim;
     let seq = cfg.seq;
     let q_dim = cfg.q_dim;
-    let kv_dim = cfg.kv_dim;
     let hidden = cfg.hidden;
     let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
 
@@ -1391,17 +1370,10 @@ pub fn forward_into_pipelined(
             sdpa_out_ch,
             seq,
             2 * q_dim,
-            kv_dim,
+            q_dim,
             &mut cache.k_rope,
         );
-        read_channels_into(
-            &locked,
-            sdpa_out_ch,
-            seq,
-            2 * q_dim + kv_dim,
-            kv_dim,
-            &mut cache.v,
-        );
+        read_channels_into(&locked, sdpa_out_ch, seq, 3 * q_dim, q_dim, &mut cache.v);
     }
 
     // 4. Stage woFwd activations only
@@ -1546,7 +1518,6 @@ pub fn forward_timed(
     let dim = cfg.dim;
     let seq = cfg.seq;
     let q_dim = cfg.q_dim;
-    let kv_dim = cfg.kv_dim;
     let hidden = cfg.hidden;
     let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
 
@@ -1599,21 +1570,14 @@ pub fn forward_timed(
     let t = Instant::now();
     let mut attn_out = vec![0.0f32; q_dim * seq];
     let mut q_rope = vec![0.0f32; q_dim * seq];
-    let mut k_rope = vec![0.0f32; kv_dim * seq];
-    let mut v = vec![0.0f32; kv_dim * seq];
+    let mut k_rope = vec![0.0f32; q_dim * seq];
+    let mut v = vec![0.0f32; q_dim * seq];
     {
         let locked = kernels.bufs.sdpa_fwd_out.as_f32_slice();
         read_channels_into(&locked, sdpa_out_ch, seq, 0, q_dim, &mut attn_out);
         read_channels_into(&locked, sdpa_out_ch, seq, q_dim, q_dim, &mut q_rope);
-        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim, kv_dim, &mut k_rope);
-        read_channels_into(
-            &locked,
-            sdpa_out_ch,
-            seq,
-            2 * q_dim + kv_dim,
-            kv_dim,
-            &mut v,
-        );
+        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim, q_dim, &mut k_rope);
+        read_channels_into(&locked, sdpa_out_ch, seq, 3 * q_dim, q_dim, &mut v);
     }
     let read_sdpa_ms = t.elapsed().as_secs_f32() * 1000.0;
 
@@ -1863,21 +1827,27 @@ pub fn backward_timed(
     }
     let stage_run_ffn_bwd_w2t_ms = t.elapsed().as_secs_f32() * 1000.0;
 
-    // 3. SiLU derivative (vvexpf + vvrecf precompute sig, then division-free scalar loop)
+    // 3. Gate activation derivative.
     let t = Instant::now();
     let n = hidden * seq;
-    {
+    if cfg.ffn_activation == FfnActivation::SwiGlu {
         vdsp::vsmul(&cache.h1, -1.0, &mut ws.neg_h1);
         vdsp::expf(&ws.neg_h1, &mut ws.exp_neg);
-        // Precompute sigmoid via vectorized reciprocal — eliminates scalar fdiv from hot loop
         vdsp::vsadd(&ws.exp_neg, 1.0, &mut ws.neg_h1); // neg_h1 = 1 + exp(-h1)
         vdsp::recf_inplace(&mut ws.neg_h1); // neg_h1 = sig = 1/(1+exp(-h1))
         for i in 0..n {
             let sig = ws.neg_h1[i];
-            let silu_val = cache.h1[i] * sig;
-            let silu_deriv = sig * (1.0 + cache.h1[i] * (1.0 - sig));
-            ws.dh3[i] = ws.dsilu_raw[i] * silu_val;
-            ws.dh1[i] = ws.dsilu_raw[i] * cache.h3[i] * silu_deriv;
+            let act = ffn_gate_activation(&cfg, cache.h1[i]);
+            let act_deriv = ffn_gate_activation_derivative(&cfg, cache.h1[i], Some(sig));
+            ws.dh3[i] = ws.dsilu_raw[i] * act;
+            ws.dh1[i] = ws.dsilu_raw[i] * cache.h3[i] * act_deriv;
+        }
+    } else {
+        for i in 0..n {
+            let act = ffn_gate_activation(&cfg, cache.h1[i]);
+            let act_deriv = ffn_gate_activation_derivative(&cfg, cache.h1[i], None);
+            ws.dh3[i] = ws.dsilu_raw[i] * act;
+            ws.dh1[i] = ws.dsilu_raw[i] * cache.h3[i] * act_deriv;
         }
     }
     let silu_deriv_ms = t.elapsed().as_secs_f32() * 1000.0;
@@ -2036,6 +2006,7 @@ pub fn backward_timed(
     let t = Instant::now();
     rope_backward_inplace(&mut ws.dq, heads, hd, seq, &kernels.rope);
     rope_backward_inplace(&mut ws.dk, heads, hd, seq, &kernels.rope);
+    reduce_gqa_grads(cfg, &ws.dk, &ws.dv_full, &mut ws.dk_kv, &mut ws.dv_kv);
     let rope_bwd_ms = t.elapsed().as_secs_f32() * 1000.0;
 
     // 12.5. Stage kvBwd early (dk post-RoPE)
@@ -2046,8 +2017,8 @@ pub fn backward_timed(
         let buf = &mut *locked;
         for c in 0..kv_dim {
             let row = c * kv_bwd_sp;
-            buf[row..row + seq].copy_from_slice(&ws.dk[c * seq..c * seq + seq]);
-            buf[row + seq..row + 2 * seq].copy_from_slice(&ws.dv_full[c * seq..c * seq + seq]);
+            buf[row..row + seq].copy_from_slice(&ws.dk_kv[c * seq..c * seq + seq]);
+            buf[row + seq..row + 2 * seq].copy_from_slice(&ws.dv_kv[c * seq..c * seq + seq]);
             buf[row + 2 * seq..row + 2 * seq + dim]
                 .copy_from_slice(&weights.wkt[c * dim..c * dim + dim]);
             buf[row + 2 * seq + dim..row + 2 * seq + 2 * dim]
@@ -2081,8 +2052,8 @@ pub fn backward_timed(
                 .expect("ANE eval failed");
         });
         accumulate_dw(&cache.xnorm, dim, &ws.dq, q_dim, seq, &mut grads.dwq);
-        accumulate_dw(&cache.xnorm, dim, &ws.dk, kv_dim, seq, &mut grads.dwk);
-        accumulate_dw(&cache.xnorm, dim, &ws.dv_full, kv_dim, seq, &mut grads.dwv);
+        accumulate_dw(&cache.xnorm, dim, &ws.dk_kv, kv_dim, seq, &mut grads.dwk);
+        accumulate_dw(&cache.xnorm, dim, &ws.dv_kv, kv_dim, seq, &mut grads.dwv);
         ane_handle.join().expect("ANE thread panicked");
     });
     {
@@ -2160,266 +2131,8 @@ pub fn backward(
     grads: &mut LayerGrads,
     ws: &mut BackwardWorkspace,
 ) -> Vec<f32> {
-    let dim = cfg.dim;
-    let seq = cfg.seq;
-    let q_dim = cfg.q_dim;
-    let kv_dim = cfg.kv_dim;
-    let hidden = cfg.hidden;
-    let heads = cfg.heads;
-    let hd = cfg.hd;
-    let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
-
-    // ── 1. Scale dy for FFN residual (vDSP vectorized) ──
-    vdsp::vsmul(dy, alpha, &mut ws.dffn);
-
-    // ── 2. ffnBwdW2t(ANE): dffn @ W2 → dsilu_raw [HIDDEN, SEQ] ──
-    kernels.bufs.ffn_bwd_w2t_dffn.copy_from_f32(&ws.dffn);
-    kernels.bufs.ffn_bwd_w2t_w2.copy_from_f32(&weights.w2);
-    kernels
-        .ffn_bwd_w2t
-        .run_cached_direct(
-            &[&kernels.bufs.ffn_bwd_w2t_dffn, &kernels.bufs.ffn_bwd_w2t_w2],
-            &[&kernels.bufs.ffn_bwd_w2t_out],
-        )
-        .expect("ANE eval failed");
-
-    {
-        let locked = kernels.bufs.ffn_bwd_w2t_out.as_f32_slice();
-        ws.dsilu_raw.copy_from_slice(&locked[..hidden * seq]);
-    }
-
-    // ── 3. SiLU derivative (vvexpf + vvrecf precompute sig, then division-free scalar loop) ──
-    let n = hidden * seq;
-    {
-        vdsp::vsmul(&cache.h1, -1.0, &mut ws.neg_h1);
-        vdsp::expf(&ws.neg_h1, &mut ws.exp_neg);
-        // Precompute sigmoid via vectorized reciprocal — eliminates scalar fdiv from hot loop
-        vdsp::vsadd(&ws.exp_neg, 1.0, &mut ws.neg_h1); // neg_h1 = 1 + exp(-h1)
-        vdsp::recf_inplace(&mut ws.neg_h1); // neg_h1 = sig = 1/(1+exp(-h1))
-        for i in 0..n {
-            let sig = ws.neg_h1[i];
-            let silu_val = cache.h1[i] * sig;
-            let silu_deriv = sig * (1.0 + cache.h1[i] * (1.0 - sig));
-            ws.dh3[i] = ws.dsilu_raw[i] * silu_val;
-            ws.dh1[i] = ws.dsilu_raw[i] * cache.h3[i] * silu_deriv;
-        }
-    }
-
-    // ── 4. Stage ffnBwdW13t using cached transposed weights ──
-    let w13t_sp = dyn_matmul::dual_spatial_width(seq, dim);
-    {
-        let mut locked = kernels.bufs.ffn_bwd_w13t_in.as_f32_slice_mut();
-        let buf = &mut *locked;
-        stage_spatial(buf, hidden, w13t_sp, &ws.dh1, seq, 0);
-        stage_spatial(buf, hidden, w13t_sp, &ws.dh3, seq, seq);
-        stage_spatial(buf, hidden, w13t_sp, &weights.w1t, dim, 2 * seq);
-        stage_spatial(buf, hidden, w13t_sp, &weights.w3t, dim, 2 * seq + dim);
-    }
-
-    // ── 5. ASYNC: ANE ffnBwdW13t || CPU dW3 accumulation ──
-    // dW2 moved to step 9 (sdpaBwd1 overlap), dW1 moved to step 10 (sdpaBwd2 overlap)
-    std::thread::scope(|s| {
-        let ane_handle = s.spawn(|| {
-            kernels
-                .ffn_bwd_w13t
-                .run_cached_direct(
-                    &[&kernels.bufs.ffn_bwd_w13t_in],
-                    &[&kernels.bufs.ffn_bwd_w13t_out],
-                )
-                .expect("ANE eval failed");
-        });
-        accumulate_dw(&cache.x2norm, dim, &ws.dh3, hidden, seq, &mut grads.dw3);
-        ane_handle.join().expect("ANE thread panicked");
-    });
-
-    {
-        let locked = kernels.bufs.ffn_bwd_w13t_out.as_f32_slice();
-        ws.dx_ffn.copy_from_slice(&locked[..dim * seq]);
-    }
-
-    // ── 6. RMSNorm2 backward (CPU): channel-first, no transpose ──
-    rmsnorm::backward_channel_first(
-        &ws.dx_ffn,
-        &cache.x2,
-        &weights.gamma2,
-        &cache.rms_inv2,
-        &mut ws.dx2,
-        &mut grads.dgamma2,
-        dim,
-        seq,
-        &mut ws.rms_dot_buf,
-    );
-    // Add residual gradient: dx2 += dy (FFN residual branch, vDSP vectorized)
-    vdsp::vadd(&ws.dx2, dy, &mut ws.dx2_tmp);
-    ws.dx2.copy_from_slice(&ws.dx2_tmp);
-
-    // ── 7. Scale dx2 for attention residual (vDSP vectorized) ──
-    vdsp::vsmul(&ws.dx2, alpha, &mut ws.dx2_scaled);
-
-    // ── 8. wotBwd(ANE): dx2_scaled @ Wo → da [Q_DIM, SEQ] ──
-    {
-        kernels.bufs.wot_bwd_dx2.copy_from_f32(&ws.dx2_scaled);
-        kernels.bufs.wot_bwd_wot.copy_from_f32(&weights.wot);
-    }
-    let bwd1_out_ch = sdpa_bwd::bwd1_output_channels(cfg);
-    // ASYNC: ANE wotBwd || pre-stage 3 of 4 sdpaBwd1 inputs (from forward cache)
-    std::thread::scope(|s| {
-        let ane_handle = s.spawn(|| {
-            kernels
-                .wot_bwd_split
-                .run_cached_direct(
-                    &[&kernels.bufs.wot_bwd_dx2, &kernels.bufs.wot_bwd_wot],
-                    &[&kernels.bufs.wot_bwd_out],
-                )
-                .expect("ANE eval failed");
-        });
-        kernels.bufs.sdpa_bwd1_q.copy_from_f32(&cache.q_rope);
-        kernels.bufs.sdpa_bwd1_k.copy_from_f32(&cache.k_rope);
-        kernels.bufs.sdpa_bwd1_v.copy_from_f32(&cache.v);
-        ane_handle.join().expect("ANE thread panicked");
-    });
-
-    {
-        let locked = kernels.bufs.wot_bwd_out.as_f32_slice();
-        ws.da.copy_from_slice(&locked[..q_dim * seq]);
-    }
-
-    // ── 9. Stage remaining sdpaBwd1 input (da depends on wotBwd output) ──
-    kernels.bufs.sdpa_bwd1_da.copy_from_f32(&ws.da);
-
-    // ASYNC: ANE sdpaBwd1 || CPU dWo + dW2 accumulation
-    // dW2 moved from step 5 to rebalance CPU load across async blocks
-    std::thread::scope(|s| {
-        let ane_handle = s.spawn(|| {
-            kernels
-                .sdpa_bwd1
-                .run_cached_direct(
-                    &[
-                        &kernels.bufs.sdpa_bwd1_q,
-                        &kernels.bufs.sdpa_bwd1_k,
-                        &kernels.bufs.sdpa_bwd1_v,
-                        &kernels.bufs.sdpa_bwd1_da,
-                    ],
-                    &[&kernels.bufs.sdpa_bwd1_out],
-                )
-                .expect("ANE eval failed");
-        });
-        accumulate_dw(
-            &cache.attn_out,
-            q_dim,
-            &ws.dx2_scaled,
-            dim,
-            seq,
-            &mut grads.dwo,
-        );
-        accumulate_dw(&ws.dffn, dim, &cache.gate, hidden, seq, &mut grads.dw2);
-        ane_handle.join().expect("ANE thread panicked");
-    });
-
-    {
-        let locked = kernels.bufs.sdpa_bwd1_out.as_f32_slice();
-        read_channels_into(&locked, bwd1_out_ch, seq, 0, q_dim, &mut ws.dv_full);
-    }
-
-    // ── 10. sdpaBwd2(ANE) ──
-    let bwd2_out_ch = sdpa_bwd::bwd2_output_channels(cfg);
-    kernels.bufs.sdpa_bwd2_q.copy_from_f32(&cache.q_rope);
-    kernels.bufs.sdpa_bwd2_k.copy_from_f32(&cache.k_rope);
-    // ASYNC: ANE sdpaBwd2 || dW1 (moved from step 5 to rebalance)
-    std::thread::scope(|s| {
-        let ane_handle = s.spawn(|| {
-            kernels
-                .sdpa_bwd2
-                .run_cached_direct(
-                    &[
-                        &kernels.bufs.sdpa_bwd1_out,
-                        &kernels.bufs.sdpa_bwd2_q,
-                        &kernels.bufs.sdpa_bwd2_k,
-                    ],
-                    &[&kernels.bufs.sdpa_bwd2_out],
-                )
-                .expect("ANE eval failed");
-        });
-        accumulate_dw(&cache.x2norm, dim, &ws.dh1, hidden, seq, &mut grads.dw1);
-        ane_handle.join().expect("ANE thread panicked");
-    });
-    {
-        let locked = kernels.bufs.sdpa_bwd2_out.as_f32_slice();
-        read_channels_into(&locked, bwd2_out_ch, seq, 0, q_dim, &mut ws.dq);
-        read_channels_into(&locked, bwd2_out_ch, seq, q_dim, q_dim, &mut ws.dk);
-    }
-
-    // ── 11. RoPE backward in-place (CPU, cached tables) ──
-    rope_backward_inplace(&mut ws.dq, heads, hd, seq, &kernels.rope);
-    rope_backward_inplace(&mut ws.dk, heads, hd, seq, &kernels.rope);
-
-    // ── 11.5. Stage kvBwd early (dk post-RoPE) ──
-    let kv_bwd_sp = dyn_matmul::dual_spatial_width(seq, dim);
-    {
-        let mut locked = kernels.bufs.kv_bwd_in.as_f32_slice_mut();
-        let buf = &mut *locked;
-        for c in 0..kv_dim {
-            let row = c * kv_bwd_sp;
-            buf[row..row + seq].copy_from_slice(&ws.dk[c * seq..c * seq + seq]);
-            buf[row + seq..row + 2 * seq].copy_from_slice(&ws.dv_full[c * seq..c * seq + seq]);
-            buf[row + 2 * seq..row + 2 * seq + dim]
-                .copy_from_slice(&weights.wkt[c * dim..c * dim + dim]);
-            buf[row + 2 * seq + dim..row + 2 * seq + 2 * dim]
-                .copy_from_slice(&weights.wvt[c * dim..c * dim + dim]);
-        }
-    }
-
-    // ── 12. Stage qBwd ──
-    kernels.bufs.q_bwd_dq.copy_from_f32(&ws.dq);
-    kernels.bufs.q_bwd_wqt.copy_from_f32(&weights.wqt);
-
-    // ── 13. ASYNC: ANE qBwd+kvBwd || CPU dWq+dWk+dWv ──
-    std::thread::scope(|s| {
-        let ane_handle = s.spawn(|| {
-            kernels
-                .q_bwd_split
-                .run_cached_direct(
-                    &[&kernels.bufs.q_bwd_dq, &kernels.bufs.q_bwd_wqt],
-                    &[&kernels.bufs.q_bwd_out],
-                )
-                .expect("ANE eval failed");
-            kernels
-                .kv_bwd
-                .run_cached_direct(&[&kernels.bufs.kv_bwd_in], &[&kernels.bufs.kv_bwd_out])
-                .expect("ANE eval failed");
-        });
-        accumulate_dw(&cache.xnorm, dim, &ws.dq, q_dim, seq, &mut grads.dwq);
-        accumulate_dw(&cache.xnorm, dim, &ws.dk, kv_dim, seq, &mut grads.dwk);
-        accumulate_dw(&cache.xnorm, dim, &ws.dv_full, kv_dim, seq, &mut grads.dwv);
-        ane_handle.join().expect("ANE thread panicked");
-    });
-    {
-        let locked = kernels.bufs.q_bwd_out.as_f32_slice();
-        ws.dx_attn.copy_from_slice(&locked[..dim * seq]);
-    }
-    {
-        let locked = kernels.bufs.kv_bwd_out.as_f32_slice();
-        ws.dx_kv.copy_from_slice(&locked[..dim * seq]);
-    }
-    vdsp::vadd(&ws.dx_attn, &ws.dx_kv, &mut ws.dx_merged);
-
-    // ── 16. RMSNorm1 backward (CPU): channel-first, no transpose ──
-    rmsnorm::backward_channel_first(
-        &ws.dx_merged,
-        &cache.x,
-        &weights.gamma1,
-        &cache.rms_inv1,
-        &mut ws.dx_rms1,
-        &mut grads.dgamma1,
-        dim,
-        seq,
-        &mut ws.rms_dot_buf,
-    );
-
-    // ── 17. Final: dx = dx_rms1 + dx2 (residual from attention branch, vDSP vectorized) ──
-    let mut dx = vec![0.0f32; dim * seq]; // only allocation — return value
-    vdsp::vadd(&ws.dx_rms1, &ws.dx2, &mut dx);
-
+    let mut dx = vec![0.0f32; cfg.dim * cfg.seq];
+    backward_into(cfg, kernels, weights, cache, dy, grads, ws, &mut dx);
     dx
 }
 
@@ -2528,11 +2241,13 @@ fn backward_into_impl(
                 }
             }
         }
-        // Pre-compute sigmoid(h1) — doesn't need dsilu_raw (ANE output), safe to overlap
-        vdsp::vsmul(&cache.h1, -1.0, &mut ws.neg_h1);
-        vdsp::expf(&ws.neg_h1, &mut ws.exp_neg);
-        vdsp::vsadd(&ws.exp_neg, 1.0, &mut ws.neg_h1); // neg_h1 = 1 + exp(-h1)
-        vdsp::recf_inplace(&mut ws.neg_h1); // neg_h1 = sig = 1/(1+exp(-h1))
+        if cfg.ffn_activation == FfnActivation::SwiGlu {
+            // Pre-compute sigmoid(h1) — doesn't need dsilu_raw (ANE output), safe to overlap
+            vdsp::vsmul(&cache.h1, -1.0, &mut ws.neg_h1);
+            vdsp::expf(&ws.neg_h1, &mut ws.exp_neg);
+            vdsp::vsadd(&ws.exp_neg, 1.0, &mut ws.neg_h1); // neg_h1 = 1 + exp(-h1)
+            vdsp::recf_inplace(&mut ws.neg_h1); // neg_h1 = sig = 1/(1+exp(-h1))
+        }
         ane_handle.join().expect("ANE thread panicked");
     });
     {
@@ -2540,15 +2255,22 @@ fn backward_into_impl(
         ws.dsilu_raw.copy_from_slice(&locked[..hidden * seq]);
     }
 
-    // 3. SiLU backward scalar loop (sig already in neg_h1 from step 2 overlap)
+    // 3. Gate activation backward scalar loop.
     let n = hidden * seq;
-    {
+    if cfg.ffn_activation == FfnActivation::SwiGlu {
         for i in 0..n {
             let sig = ws.neg_h1[i];
-            let silu_val = cache.h1[i] * sig;
-            let silu_deriv = sig * (1.0 + cache.h1[i] * (1.0 - sig));
-            ws.dh3[i] = ws.dsilu_raw[i] * silu_val;
-            ws.dh1[i] = ws.dsilu_raw[i] * cache.h3[i] * silu_deriv;
+            let act = ffn_gate_activation(&cfg, cache.h1[i]);
+            let act_deriv = ffn_gate_activation_derivative(&cfg, cache.h1[i], Some(sig));
+            ws.dh3[i] = ws.dsilu_raw[i] * act;
+            ws.dh1[i] = ws.dsilu_raw[i] * cache.h3[i] * act_deriv;
+        }
+    } else {
+        for i in 0..n {
+            let act = ffn_gate_activation(&cfg, cache.h1[i]);
+            let act_deriv = ffn_gate_activation_derivative(&cfg, cache.h1[i], None);
+            ws.dh3[i] = ws.dsilu_raw[i] * act;
+            ws.dh1[i] = ws.dsilu_raw[i] * cache.h3[i] * act_deriv;
         }
     }
 
@@ -2725,6 +2447,7 @@ fn backward_into_impl(
     // 11. RoPE backward
     rope_backward_inplace(&mut ws.dq, heads, hd, seq, &kernels.rope);
     rope_backward_inplace(&mut ws.dk, heads, hd, seq, &kernels.rope);
+    reduce_gqa_grads(cfg, &ws.dk, &ws.dv_full, &mut ws.dk_kv, &mut ws.dv_kv);
 
     // 11.5. Stage kvBwd early (dk post-RoPE)
     let kv_bwd_sp = dyn_matmul::dual_spatial_width(seq, dim);
@@ -2733,8 +2456,8 @@ fn backward_into_impl(
         let buf = &mut *locked;
         for c in 0..kv_dim {
             let row = c * kv_bwd_sp;
-            buf[row..row + seq].copy_from_slice(&ws.dk[c * seq..c * seq + seq]);
-            buf[row + seq..row + 2 * seq].copy_from_slice(&ws.dv_full[c * seq..c * seq + seq]);
+            buf[row..row + seq].copy_from_slice(&ws.dk_kv[c * seq..c * seq + seq]);
+            buf[row + seq..row + 2 * seq].copy_from_slice(&ws.dv_kv[c * seq..c * seq + seq]);
             buf[row + 2 * seq..row + 2 * seq + dim]
                 .copy_from_slice(&weights.wkt[c * dim..c * dim + dim]);
             buf[row + 2 * seq + dim..row + 2 * seq + 2 * dim]
@@ -2762,8 +2485,8 @@ fn backward_into_impl(
                 .expect("ANE eval failed");
         });
         accumulate_dw(&cache.xnorm, dim, &ws.dq, q_dim, seq, &mut grads.dwq);
-        accumulate_dw(&cache.xnorm, dim, &ws.dk, kv_dim, seq, &mut grads.dwk);
-        accumulate_dw(&cache.xnorm, dim, &ws.dv_full, kv_dim, seq, &mut grads.dwv);
+        accumulate_dw(&cache.xnorm, dim, &ws.dk_kv, kv_dim, seq, &mut grads.dwk);
+        accumulate_dw(&cache.xnorm, dim, &ws.dv_kv, kv_dim, seq, &mut grads.dwv);
         ane_handle.join().expect("ANE thread panicked");
     });
     {
@@ -2832,6 +2555,35 @@ fn rope_backward_inplace(dx: &mut [f32], heads: usize, hd: usize, seq: usize, ro
                 let d1 = dx[base1 + p];
                 dx[base0 + p] = c * d0 + s * d1;
                 dx[base1 + p] = -s * d0 + c * d1;
+            }
+        }
+    }
+}
+
+fn reduce_gqa_grads(
+    cfg: &ModelConfig,
+    dk_tiled: &[f32],
+    dv_tiled: &[f32],
+    dk_kv: &mut [f32],
+    dv_kv: &mut [f32],
+) {
+    let kv_elems = cfg.kv_dim * cfg.seq;
+    if cfg.gqa_ratio == 1 {
+        dk_kv[..kv_elems].copy_from_slice(&dk_tiled[..kv_elems]);
+        dv_kv[..kv_elems].copy_from_slice(&dv_tiled[..kv_elems]);
+        return;
+    }
+
+    dk_kv[..kv_elems].fill(0.0);
+    dv_kv[..kv_elems].fill(0.0);
+    let head_span = cfg.hd * cfg.seq;
+    for kv_head in 0..cfg.kv_heads {
+        let dst = kv_head * head_span;
+        for group in 0..cfg.gqa_ratio {
+            let src = (kv_head * cfg.gqa_ratio + group) * head_span;
+            for i in 0..head_span {
+                dk_kv[dst + i] += dk_tiled[src + i];
+                dv_kv[dst + i] += dv_tiled[src + i];
             }
         }
     }

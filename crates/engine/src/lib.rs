@@ -15,5 +15,6 @@ pub mod kernels;
 pub mod layer;
 pub mod metal_adam;
 pub mod metal_ffn;
+pub mod metal_muon;
 pub mod model;
 pub mod training;

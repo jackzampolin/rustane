@@ -15,7 +15,7 @@ use engine::full_model::{
 use engine::layer::CompiledKernels;
 use engine::metal_adam::MetalAdam;
 use engine::metal_ffn::MetalFFN;
-use engine::model::ModelConfig;
+use engine::model::{FfnActivation, ModelConfig};
 use std::time::Instant;
 
 /// Build a custom ModelConfig (all MHA, hd=128, vocab=8192).
@@ -38,6 +38,7 @@ fn custom_config(
         q_dim: heads * 128,
         kv_dim: heads * 128,
         gqa_ratio: 1,
+        ffn_activation: FfnActivation::SwiGlu,
     }
 }
 

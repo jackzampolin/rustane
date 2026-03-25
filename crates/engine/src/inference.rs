@@ -924,6 +924,7 @@ fn sample_block_logits(base: u32, logits: &[f32], temperature: f32, rng: &mut u6
 mod tests {
     use super::*;
     use crate::full_model::ModelWeights;
+    use crate::model::FfnActivation;
 
     fn tiny_cfg() -> ModelConfig {
         ModelConfig {
@@ -938,6 +939,7 @@ mod tests {
             q_dim: 256,
             kv_dim: 256,
             gqa_ratio: 1,
+            ffn_activation: FfnActivation::SwiGlu,
         }
     }
 
