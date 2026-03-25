@@ -727,7 +727,14 @@ impl LayerWeights {
 
     /// Refresh cached transpose views used by backward ANE kernels.
     pub fn refresh_transposes(&mut self, cfg: &ModelConfig) {
-        vdsp::mtrans(&self.wq, cfg.q_dim, &mut self.wqt, cfg.dim, cfg.dim, cfg.q_dim);
+        vdsp::mtrans(
+            &self.wq,
+            cfg.q_dim,
+            &mut self.wqt,
+            cfg.dim,
+            cfg.dim,
+            cfg.q_dim,
+        );
         vdsp::mtrans(
             &self.wk,
             cfg.kv_dim,
@@ -744,7 +751,14 @@ impl LayerWeights {
             cfg.dim,
             cfg.kv_dim,
         );
-        vdsp::mtrans(&self.wo, cfg.dim, &mut self.wot, cfg.q_dim, cfg.q_dim, cfg.dim);
+        vdsp::mtrans(
+            &self.wo,
+            cfg.dim,
+            &mut self.wot,
+            cfg.q_dim,
+            cfg.q_dim,
+            cfg.dim,
+        );
         vdsp::mtrans(
             &self.w1,
             cfg.hidden,
@@ -2446,7 +2460,9 @@ pub fn backward_into(
     ws: &mut BackwardWorkspace,
     dx_out: &mut [f32],
 ) {
-    backward_into_impl(cfg, kernels, None, weights, cache, dy, grads, ws, None, dx_out);
+    backward_into_impl(
+        cfg, kernels, None, weights, cache, dy, grads, ws, None, dx_out,
+    );
 }
 
 fn backward_into_impl(

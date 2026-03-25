@@ -5,9 +5,12 @@
 //! CPU fallback for unsupported ops.
 
 pub mod bench_result;
+pub mod checkpoint;
 pub mod cpu;
 pub mod data;
+pub mod decode;
 pub mod full_model;
+pub mod inference;
 pub mod kernels;
 pub mod layer;
 pub mod metal_adam;

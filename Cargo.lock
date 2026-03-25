@@ -519,6 +519,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tokenizers",
 ]
 
 [[package]]
@@ -1210,6 +1211,12 @@ dependencies = [
 [[package]]
 name = "metal-decode"
 version = "0.1.0"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "objc2-metal-performance-shaders",
+]
 
 [[package]]
 name = "mime"

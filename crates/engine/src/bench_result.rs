@@ -4,8 +4,8 @@
 //! `target/bench-result.json`. Users then run `make submit` to post it.
 
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BenchResult {

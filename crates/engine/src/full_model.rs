@@ -5,8 +5,8 @@
 
 use crate::cpu::{cross_entropy, embedding, rmsnorm, vdsp};
 use crate::layer::{
-    self, BackwardWorkspace, CompiledKernels, FfnBwdW13tCache, FfnBwdW13tCacheStats,
-    ForwardCache, LayerGrads, LayerWeights,
+    self, BackwardWorkspace, CompiledKernels, FfnBwdW13tCache, FfnBwdW13tCacheStats, ForwardCache,
+    LayerGrads, LayerWeights,
 };
 use crate::metal_adam::MetalAdam;
 use crate::metal_ffn::MetalFFN;
@@ -253,44 +253,43 @@ impl ModelForwardWorkspace {
     }
 }
 
-/// Forward pass using pre-allocated workspace (zero heap allocations in steady state).
-/// Returns loss. All intermediate data lives in `ws` for backward_ws to read.
-pub fn forward_ws(
+/// Forward pass through embeddings/layers/final norm/output projection, writing logits into `ws`.
+/// `tokens` must be length `cfg.seq`.
+pub fn forward_logits_ws(
     cfg: &ModelConfig,
     kernels: &CompiledKernels,
     weights: &ModelWeights,
     tokens: &[u32],
-    targets: &[u32],
     softcap: f32,
     ws: &mut ModelForwardWorkspace,
-) -> f32 {
-    forward_ws_with_options(
+) {
+    forward_logits_ws_with_options(
         cfg,
         kernels,
         weights,
         tokens,
-        targets,
         softcap,
         ws,
         ForwardOptions::default(),
     )
 }
 
-/// Forward pass using pre-allocated workspace and optional GPU FFN acceleration.
-pub fn forward_ws_with_options(
+/// Forward-only pass with optional GPU FFN acceleration, writing logits into `ws`.
+pub fn forward_logits_ws_with_options(
     cfg: &ModelConfig,
     kernels: &CompiledKernels,
     weights: &ModelWeights,
     tokens: &[u32],
-    targets: &[u32],
     softcap: f32,
     ws: &mut ModelForwardWorkspace,
     opts: ForwardOptions<'_>,
-) -> f32 {
+) {
     let dim = cfg.dim;
     let seq = cfg.seq;
     let vocab = cfg.vocab;
     let use_gpu_ffn = opts.use_gpu_ffn && opts.metal_ffn.is_some();
+
+    assert_eq!(tokens.len(), seq, "tokens must match cfg.seq");
 
     // 1. Embedding lookup → x_buf [DIM, SEQ]
     embedding::forward(&weights.embed, dim, tokens, &mut ws.x_row);
@@ -358,7 +357,7 @@ pub fn forward_ws_with_options(
 
     // 5. Logits: x_final^T @ embed^T → [SEQ, VOCAB]
     //    sgemm_at uses beta=1.0 (C += A@B^T), so zero logits first to prevent
-    //    accumulation across microbatch calls.
+    //    accumulation across repeated inference calls.
     vdsp::mtrans(&ws.x_final, seq, &mut ws.x_final_row, dim, dim, seq);
     ws.logits.fill(0.0);
     vdsp::sgemm_at(
@@ -372,12 +371,51 @@ pub fn forward_ws_with_options(
 
     // 6. Softcap: logits = softcap * tanh(logits / softcap)
     //    Store unscaled tanh in logits_capped for backward (avoids extra pass + simplifies derivative).
-    let has_softcap = softcap > 0.0;
-    if has_softcap {
-        vdsp::sscal(&mut ws.logits, 1.0 / softcap); // pass 1: logits /= softcap
-        vdsp::tanhf(&ws.logits, &mut ws.logits_capped); // pass 2: logits_capped = tanh(logits/softcap)
-        vdsp::vsmul(&ws.logits_capped, softcap, &mut ws.logits); // pass 3: logits = softcap * tanh(...)
+    if softcap > 0.0 {
+        vdsp::sscal(&mut ws.logits, 1.0 / softcap);
+        vdsp::tanhf(&ws.logits, &mut ws.logits_capped);
+        vdsp::vsmul(&ws.logits_capped, softcap, &mut ws.logits);
     }
+}
+
+/// Forward pass using pre-allocated workspace (zero heap allocations in steady state).
+/// Returns loss. All intermediate data lives in `ws` for backward_ws to read.
+pub fn forward_ws(
+    cfg: &ModelConfig,
+    kernels: &CompiledKernels,
+    weights: &ModelWeights,
+    tokens: &[u32],
+    targets: &[u32],
+    softcap: f32,
+    ws: &mut ModelForwardWorkspace,
+) -> f32 {
+    forward_ws_with_options(
+        cfg,
+        kernels,
+        weights,
+        tokens,
+        targets,
+        softcap,
+        ws,
+        ForwardOptions::default(),
+    )
+}
+
+/// Forward pass using pre-allocated workspace and optional GPU FFN acceleration.
+pub fn forward_ws_with_options(
+    cfg: &ModelConfig,
+    kernels: &CompiledKernels,
+    weights: &ModelWeights,
+    tokens: &[u32],
+    targets: &[u32],
+    softcap: f32,
+    ws: &mut ModelForwardWorkspace,
+    opts: ForwardOptions<'_>,
+) -> f32 {
+    let vocab = cfg.vocab;
+    let seq = cfg.seq;
+
+    forward_logits_ws_with_options(cfg, kernels, weights, tokens, softcap, ws, opts);
 
     // 7. Cross-entropy
     let total_loss = cross_entropy::forward_backward_batch(

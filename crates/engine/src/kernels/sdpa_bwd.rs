@@ -487,11 +487,7 @@ pub fn build_bwd2_split_from_bwd1(cfg: &ModelConfig) -> Graph {
 
     // Slice probs and dp directly from sdpaBwd1 output.
     let probs_flat = g.slice(bwd1_out, [0, q_dim, 0, 0], [1, score_ch, 1, seq]);
-    let dp_flat = g.slice(
-        bwd1_out,
-        [0, q_dim + score_ch, 0, 0],
-        [1, score_ch, 1, seq],
-    );
+    let dp_flat = g.slice(bwd1_out, [0, q_dim + score_ch, 0, 0], [1, score_ch, 1, seq]);
 
     let probs = g.reshape(
         probs_flat,

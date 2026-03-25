@@ -193,7 +193,9 @@ fn metal_ffn_matches_cpu_reference() {
     let gate_diff = max_abs_diff(&cpu_gate, &gpu_gate);
     let x_next_diff = max_abs_diff(&cpu_x_next, &gpu_x_next);
 
-    println!("cpu vs metal: h1={h1_diff:.6} h3={h3_diff:.6} gate={gate_diff:.6} x_next={x_next_diff:.6}");
+    println!(
+        "cpu vs metal: h1={h1_diff:.6} h3={h3_diff:.6} gate={gate_diff:.6} x_next={x_next_diff:.6}"
+    );
 
     assert!(h1_diff < 0.01, "h1 diff too large: {h1_diff}");
     assert!(h3_diff < 0.01, "h3 diff too large: {h3_diff}");
@@ -426,7 +428,12 @@ fn gpu_ffn_600m_backward_matches_ane() {
     let mut bwd_ws_gpu = ModelBackwardWorkspace::new(&cfg);
     let bwd_opts = if std::env::var("RUSTANE_USE_GPU_FFN_BWD_DX")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+        .map(|v| {
+            matches!(
+                v.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
         .unwrap_or(false)
     {
         full_model::BackwardOptions::gpu_ffn_dx(&metal_ffn)
@@ -470,5 +477,8 @@ fn gpu_ffn_600m_backward_matches_ane() {
     assert!(dembed_diff < 0.01, "dembed diff too large: {dembed_diff}");
     assert!(l0_dw1_diff < 0.01, "l0.dw1 diff too large: {l0_dw1_diff}");
     assert!(l0_dw2_diff < 0.01, "l0.dw2 diff too large: {l0_dw2_diff}");
-    assert!(l19_dw2_diff < 0.01, "l19.dw2 diff too large: {l19_dw2_diff}");
+    assert!(
+        l19_dw2_diff < 0.01,
+        "l19.dw2 diff too large: {l19_dw2_diff}"
+    );
 }
